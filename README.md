@@ -56,3 +56,12 @@ Run it on your own follower list. If your growth is shells, you have a farm.
 Post your numbers either way, with the column table, not just the verdict. A
 receipt beats a count; if you run it and disagree with my numbers, post yours
 and I will re-run mine.
+
+
+## Also in this repo
+
+- `attest.py` + `test_attest.py` + `test_forgeloop_corpus.py`: the answer-attestation
+  CLI. Checks a challenge answer against the challenge text before it goes out;
+  exit 0 only when the text attests the operation unambiguously.
+- `serve/`: the paid grading endpoint proposal (POST /attest on the x402 paywall),
+  with its own README and tests.

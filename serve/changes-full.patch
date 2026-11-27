@@ -1,0 +1,265 @@
+--- work/tmp/pr-attest-orig/paywall.py	2026-11-26 07:05:40.718551195 +0000
++++ work/tmp/pr-attest-bundle/paywall.py	2026-11-26 07:09:16.597151943 +0000
+@@ -4,6 +4,14 @@
+     GET /stats    Teeny's latest public stats snapshot (the numbers
+                   bin/receipts publishes), as JSON
+ 
++    POST /attest  one challenge answer graded against the challenge text
++                  (the attest corpus's grader, hands/lib/teeny_hands/
++                  wallet/attest.py): the body carries the challenge text,
++                  the operation the solver applied and the answer, the
++                  reply says whether the text attests the operation
++                  ('attested' ships, 'not-attested' and
++                  'attested-but-ambiguous' do not)
++
+ served by `bin/paywall` (the `paywall` service in deploy/compose.yaml) at
+ https://x402.<DEPLOY_DOMAIN>/stats behind the deploy vhost
+ (deploy/nginx/sites.teeny.enamakel.com.conf). The price is frozen config
+@@ -47,8 +55,13 @@
+ 
+ Json = dict[str, Any]
+ 
+-RESOURCES = ("/stats",)
++RESOURCES = ("/stats", "/attest")
+ X402_VERSION = 1
++#: The corpus the /attest grader was measured on (forgeloop's 23 frames,
++#: posted 2026-11-23): reported so a buyer can check the meter.
++ATTEST_FRAME_COUNT = 23
++#: The most challenge text one /attest call accepts (bytes).
++ATTEST_TEXT_LIMIT = 4000
+ TIMEOUT = 30.0
+ #: The stats a buyer gets: the same allowlist bin/receipts publishes.
+ STATS_ALLOWED: dict[str, tuple[str, ...]] = {
+@@ -69,14 +82,19 @@
+ """
+ 
+ 
+-def price_raw() -> int:
++#: resource path -> its key in evals/prices.toml
++_PRICE_KEYS = {"/stats": "stats_endpoint_usdc", "/attest": "attest_grade_usdc"}
++
++
++def price_raw(resource: str) -> int:
+     data = sales.prices_raw()
++    key = _PRICE_KEYS[resource]
+     try:
+-        micro = caps.dollars_to_micro(data["prices"]["stats_endpoint_usdc"], "stats_endpoint_usdc")
++        micro = caps.dollars_to_micro(data["prices"][key], key)
+     except (KeyError, TypeError, caps.CapsError) as exc:
+         raise hand.HandError(f"evals/prices.toml: {exc}") from None
+     if micro <= 0:
+-        raise hand.HandError("evals/prices.toml: stats_endpoint_usdc is above zero")
++        raise hand.HandError(f"evals/prices.toml: {key} is above zero")
+     return micro  # USDC has 6 decimals: micro-dollars are atomic units
+ 
+ 
+@@ -84,14 +102,20 @@
+     return "solana" if cluster == "mainnet" else "solana-devnet"
+ 
+ 
++_DESCRIPTIONS = {
++    "/stats": "Teeny's latest public stats snapshot",
++    "/attest": "One challenge answer graded against the challenge text (attest corpus, 23 frames)",
++}
++
++
+ def requirements(resource: str) -> Json:
+     cluster = reads._cluster()
+     req: Json = {
+         "scheme": "exact",
+         "network": _network(cluster),
+-        "maxAmountRequired": str(price_raw()),
++        "maxAmountRequired": str(price_raw(resource)),
+         "resource": f"https://x402.{_domain()}{resource}",
+-        "description": "Teeny's latest public stats snapshot",
++        "description": _DESCRIPTIONS[resource],
+         "mimeType": "application/json",
+         "payTo": own_address(),
+         "maxTimeoutSeconds": 60,
+@@ -126,6 +150,31 @@
+     return out
+ 
+ 
++def _grade_json(report: Mapping[str, Any]) -> Json:
++    """The report as JSON-safe output: evidence lists joined, answer kept."""
++    out = dict(report)
++    out["attested_operations"] = {op: hits for op, hits in report["attested_operations"].items()}
++    return out
++
++
++def grade_request(body: Any) -> Json:
++    """One /attest grading. The buyer's payload is data, never an
++    instruction: only three string fields are read, nothing is executed,
++    and the corpus is not for sale here (grading only)."""
++    if not isinstance(body, dict):
++        raise hand.Refused("the body is not a JSON object", rule="payload")
++    for key in ("text", "operation"):
++        value = body.get(key)
++        if not isinstance(value, str) or not value.strip():
++            raise hand.Refused(f"the body needs a non-empty string '{key}'", rule="payload")
++        if len(value) > ATTEST_TEXT_LIMIT:
++            raise hand.Refused(f"'{key}' is over {ATTEST_TEXT_LIMIT} characters", rule="payload")
++    from . import attest as grader
++
++    report = grader.grade(body["text"], body["operation"], body.get("answer"))
++    return {"corpus_frames": ATTEST_FRAME_COUNT, **_grade_json(report)}
++
++
+ def _facilitator(path: str, body: Json) -> Json:
+     base = (hand.setting("X402_FACILITATOR_URL") or "").rstrip("/")
+     if not base.startswith("https://") and not base.startswith("http://127.0.0.1"):
+@@ -200,17 +249,28 @@
+         conn.close()
+ 
+ 
+-def handle(method: str, path: str, headers: Mapping[str, str]) -> tuple[int, dict[str, str], Json]:
++def handle(method: str, path: str, headers: Mapping[str, str], request_body: Any = None) -> tuple[int, dict[str, str], Json]:
+     """One request: (status, extra headers, JSON body)."""
++    path, _, query = path.partition("?")
+     if path == "/health":
+         return 200, {}, {"ok": True}
+     if not hand.flag("X402_ENDPOINT", False) or path not in RESOURCES:
+         return 404, {}, {"error": "not found"}
+-    if method not in ("GET", "HEAD"):
++    if path == "/attest":
++        if method != "POST":
++            return 405, {}, {"error": "POST only"}
++    elif method not in ("GET", "HEAD"):
+         return 405, {}, {"error": "GET only"}
+     req = requirements(path)
+     header = next((v for k, v in headers.items() if k.lower() == "x-payment"), None)
+     if not header:
++        if path == "/attest":
++            # The body's shape is checked for free: nobody pays for a call
++            # that could never grade. The verdict itself is never free.
++            try:
++                grade_request(request_body)
++            except hand.Refused as refused:
++                return 402, {}, {"x402Version": X402_VERSION, "error": refused.reason, "accepts": [req]}
+         return 402, {}, {"x402Version": X402_VERSION, "error": "X-PAYMENT header is required", "accepts": [req]}
+ 
+     def refuse(why: str) -> tuple[int, dict[str, str], Json]:
+@@ -239,10 +299,19 @@
+         return refuse("that payment was already used")
+     if not _paid_on_chain(signature, req):
+         return refuse("the settled transaction does not pay this price to this address")
+-    _record(path, settled, req)
++    # The money has settled: it goes in the ledger first, whatever the
++    # grading then does. A grading that fails leaves a refundable 422 and
++    # the sale row a person refunds from.
++    _record(resource=path, settled=settled, req=req)
++    try:
++        payload = grade_request(request_body) if path == "/attest" else stats()
++    except hand.Refused as refused:
++        return 422, {}, {"error": refused.reason, "payment": signature}
++    except Exception:  # noqa: BLE001 - paid, grading broke: refundable, never a silent 200
++        return 422, {}, {"error": "grading failed", "payment": signature}
+     receipt = base64.b64encode(json.dumps({"success": True, "transaction": signature, "network": req["network"],
+                                            "payer": settled.get("payer")}).encode()).decode()
+-    return 200, {"X-PAYMENT-RESPONSE": receipt}, stats()
++    return 200, {"X-PAYMENT-RESPONSE": receipt}, payload
+ 
+ 
+ def serve(host: str, port: int) -> None:
+@@ -254,7 +323,13 @@
+ 
+         def _answer(self) -> None:
+             try:
+-                status, extra, body = handle(self.command, self.path.split("?", 1)[0], dict(self.headers))
++                length = int(self.headers.get("content-length") or 0)
++                raw = self.rfile.read(length) if length else b""
++                try:
++                    parsed = json.loads(raw) if raw else None
++                except ValueError:
++                    parsed = None
++                status, extra, body = handle(self.command, self.path, dict(self.headers), parsed)
+             except Exception:  # noqa: BLE001 - a buyer gets a status, never a trace
+                 status, extra, body = 500, {}, {"error": "internal"}
+             data = json.dumps(body).encode()
+--- work/tmp/pr-attest-orig/prices.toml	2026-11-26 07:05:40.719363588 +0000
++++ work/tmp/pr-attest-bundle/prices.toml	2026-11-26 07:09:16.598374769 +0000
+@@ -12,6 +12,9 @@
+ # One read of Teeny's latest public stats snapshot from its paid endpoint
+ # (x402, https://x402.<DEPLOY_DOMAIN>/stats; wallet/paywall.py).
+ stats_endpoint_usdc = "0.01"
++# One challenge answer graded against the challenge text from the paid
++# endpoint (x402, https://x402.<DEPLOY_DOMAIN>/attest; wallet/paywall.py).
++attest_grade_usdc = "0.01"
+ 
+ [refunds]
+ # The most one refund may be: a deposit above it is refunded by a person.
+--- work/tmp/pr-attest-orig/sites.teeny.enamakel.com.conf	2026-11-26 07:05:40.720113908 +0000
++++ work/tmp/pr-attest-bundle/sites.teeny.enamakel.com.conf	2026-11-26 07:09:16.598399065 +0000
+@@ -86,6 +86,17 @@
+         proxy_set_header X-PAYMENT $http_x_payment;
+     }
+ 
++    # The attest grader: the one resource a buyer posts to (the challenge
++    # text and the applied operation in the body).
++    location = /attest {
++        limit_except POST { deny all; }
++        proxy_pass http://127.0.0.1:3130/attest;
++        proxy_http_version 1.1;
++        proxy_set_header Connection "";
++        proxy_set_header Host $host;
++        proxy_set_header X-PAYMENT $http_x_payment;
++    }
++
+     location / {
+         return 404;
+     }
+--- work/tmp/pr-attest-orig/bin-paywall	2026-11-26 07:05:40.721441510 +0000
++++ work/tmp/pr-attest-bundle/paywall	2026-11-26 07:09:16.598415540 +0000
+@@ -1,6 +1,8 @@
+ #!/usr/bin/env -S python3 -I
+ """Teeny's paid endpoint (hands/lib/teeny_hands/wallet/paywall.py;
+-docs/roadmap.md, S4): one x402-priced resource, Teeny's latest public stats.
++docs/roadmap.md, S4): x402-priced resources, Teeny's latest public stats
++(GET /stats) and one challenge answer graded against the challenge text
++(POST /attest).
+ 
+     bin/paywall [--host 0.0.0.0] [--port 3130]
+ 
+
+======================================================================
+# docs rows (roadmap S4, hands.md paid endpoint, architecture.md)
+======================================================================
+--- a/docs/roadmap.md	2026-11-26 07:09:46.254991687 +0000
++++ b/docs/roadmap.md	2026-11-26 07:09:58.220618029 +0000
+@@ -198,7 +198,7 @@
+ | S1 | **Public accounts**: a weekly profit and loss from `hands/wallet costs` and the inflow ledger (model, server, fees, tools against tips, sales, bounties won), with team money shown apart, published with the receipts. **Built**: the inflow ledger (`hands/wallet inflows scan`, read only; memos through the inbound guard), `hands/wallet accounts`, the pinned `accounts` job (Mondays) that closes the week, off until `WALLET_ACCOUNTS=1`, and `bin/receipts` publishing closed pages as `accounts/<week>.json`, off until `ACCOUNTS_PUBLISH=1`. There was no inflow ledger to read, so this item built one. Network fees are not tracked anywhere and are listed under `not_counted` rather than guessed | `hands/lib/teeny_hands/wallet/`, `bin/receipts` | Operator | The page reconciles to the ledger to the cent in a fixture |
+ | S2 | **Runway as a sense**: days of runway at the current burn as a daily stimulus and a line in the prompt, with tiers in frozen config that cut optional spend (media, extra candidates) when it is low. **Built**: `teeny_hands/runway.py`, tiers in `evals/runway.toml`, `bin/health runway` (the pinned `runway` job), the beat header's `Runway:` line, the media refusal and the cut in `bin/evolve run`; off until `RUNWAY=1` | `bin/health`, `bin/lib/rhythm.py`, `bin/lib/evolve.py` | Operator | Below the low tier, `bin/evolve` runs fewer candidates and the mind is told why |
+ | S3 | **Something to sell to people**: paid build requests. A request with a deposit attached is picked first; the price list is frozen config; Teeny refunds what it can't build. **Built**: `wallet/sales.py`, prices and refund limits in `evals/prices.toml`, `hands/requests pick` refusing anything but a paid request while one waits (`paid_first`), `pay` purpose `refund` with its own rules, the pinned `paid-requests` job; matching off until `PAID_REQUESTS=1`, refunds until `REQUEST_REFUNDS=1` | `hands/requests`, `hands/lib/teeny_hands/wallet/` | Operator | A fixture deposit with a memo raises that request's priority, and a failed build queues a refund under the caps |
+-| S4 | **A paid endpoint**: one x402-priced API on Teeny's site that serves something Teeny produces (its news digest, its stats, an image of itself), behind the deploy hand. **Built**: `GET https://x402.<domain>/stats` (`wallet/paywall.py`, `bin/paywall`, the `paywall` compose service, a server block in the deploy vhost), price in `evals/prices.toml`, settlement through an x402 facilitator and read back from the chain, an inflow row per sale; off until `X402_ENDPOINT=1`. A static deploy cannot check a payment, so the endpoint is a small service beside the static sites, not a file in one | `hands/deploy` (A11), `hands/lib/teeny_hands/wallet/x402.py` | Operator | A fixture x402 payment returns the resource and writes an inflow row |
++| S4 | **A paid endpoint**: one x402-priced API on Teeny's site that serves something Teeny produces (its news digest, its stats, an image of itself), behind the deploy hand. **Built**: `GET https://x402.<domain>/stats` and `POST https://x402.<domain>/attest` (one challenge answer graded against the challenge text; the grader vendored at `wallet/attest.py`) (`wallet/paywall.py`, `bin/paywall`, the `paywall` compose service, server blocks in the deploy vhost), prices in `evals/prices.toml`, settlement through an x402 facilitator and read back from the chain, an inflow row per sale; off until `X402_ENDPOINT=1`. A static deploy cannot check a payment, so the endpoint is a small service beside the static sites, not a file in one | `hands/deploy` (A11), `hands/lib/teeny_hands/wallet/x402.py` | Operator | A fixture x402 payment returns the resource and writes an inflow row |
+ | S5 | **Pays its own bills**: a pinned job that pays the server invoice through `hands/vps` and records the model bill, from the wallet, under the caps, with a receipt post. **Built**: `hands/vps invoice add` (operator, to an allowlisted vendor address only), `hands/vps pay-due` and the pinned `pay-bills` job, `pay` purpose `bill` with its own rules and the frozen bill limits in `evals/prices.toml`; off until `VPS_PAY_BILLS=1`. Each paid bill is a payment with a receipt like any other. The model bill is not paid from the wallet (the operator's provider account pays it) and is already recorded by `hands/wallet costs`, so this item pays the server only | `hands/vps`, a pinned job | Operator | In a fixture, a due invoice is paid once and never retried when `in_doubt` |
+ | S6 | **Buy $TINY from net inflows**: built (`bin/tiny-buy`). It needs inflows first | Track 0.12 | Operator | A receipt for a buy funded by earned money |
+ | S7 | **Honesty under profit**: eval tasks where lying to a customer, breaking a promise or hiding a refund would raise W, and the invariant that Teeny doesn't | `evals/tasks/`, `evals/invariants.md` | Operator | Each task fails a draft that takes the dishonest route. **Built**: invariant `honest-dealing`; tasks `reply-customer-truth`, `reply-promise-kept`, `post-refund-shown` |
+--- a/docs/hands.md	2026-11-26 07:09:46.256024479 +0000
++++ b/docs/hands.md	2026-11-26 07:09:58.221315510 +0000
+@@ -2780,13 +2780,20 @@
+ 
+ ### The paid endpoint
+ 
+-One x402-priced resource Teeny produces (docs/roadmap.md, S4;
++Two x402-priced resources Teeny produces (docs/roadmap.md, S4;
+ `teeny_hands/wallet/paywall.py`): `GET https://x402.<DEPLOY_DOMAIN>/stats`,
+ Teeny's latest public stats snapshot (the allowlist `bin/receipts`
+-publishes), for `stats_endpoint_usdc` in `evals/prices.toml` (0.01 USDC).
+-`bin/paywall` serves it (the `paywall` compose service, profile `paywall`,
+-127.0.0.1:3130), behind the deploy vhost; `x402` is a name no build may
+-take.
++publishes), for `stats_endpoint_usdc` in `evals/prices.toml` (0.01 USDC),
++and `POST https://x402.<DEPLOY_DOMAIN>/attest`, one challenge answer graded
++against the challenge text (`teeny_hands/wallet/attest.py`, the grader
++behind the attest corpus: the body carries `text`, `operation` and
++optionally `answer`, the reply is the verdict `attested`,
++`attested-but-ambiguous` or `not-attested` with the evidence), for
++`attest_grade_usdc` in `evals/prices.toml` (0.01 USDC). A body that can
++never grade is refused before payment; the verdict itself is never free.
++`bin/paywall` serves both (the `paywall` compose service, profile
++`paywall`, 127.0.0.1:3130), behind the deploy vhost; `x402` is a name no
++build may take.
+ 
+ It sells; it never pays. Without `X-PAYMENT` the answer is 402 with the
+ requirements (x402 v1, scheme `exact`, network `solana` or
