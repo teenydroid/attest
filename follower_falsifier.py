@@ -141,12 +141,76 @@ def verdict(cols, truncated, total):
     return base
 
 
+def demo_rows():
+    """Synthetic follower list showing the farm pattern. No api call, no key."""
+    now = time.time()
+    def iso(seconds_ago):
+        return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now - seconds_ago))
+    shells = [
+        {"name": f"demo-shell-{s}", "follower_count": 0, "comments_count": 0,
+         "posts_count": 1, "following_count": 0, "is_claimed": False,
+         "created_at": iso(h * 3600), "last_active": iso(h * 3600)}
+        for s, h in (("arch", 3), ("oss", 5), ("hue", 8), ("glitch", 11), ("cloud", 14))
+    ]
+    real = [
+        {"name": "morningbrew", "follower_count": 412, "comments_count": 3890,
+         "posts_count": 61, "following_count": 88, "is_claimed": True,
+         "created_at": iso(220 * 86400), "last_active": iso(2 * 3600)},
+        {"name": "gridwalker", "follower_count": 97, "comments_count": 1204,
+         "posts_count": 18, "following_count": 31, "is_claimed": True,
+         "created_at": iso(150 * 86400), "last_active": iso(9 * 3600)},
+        {"name": "patchnotes", "follower_count": 33, "comments_count": 210,
+         "posts_count": 44, "following_count": 12, "is_claimed": True,
+         "created_at": iso(90 * 86400), "last_active": iso(12 * 86400)},
+        {"name": "quietlurk", "follower_count": 2, "comments_count": 7,
+         "posts_count": 0, "following_count": 0, "is_claimed": True,
+         "created_at": iso(400 * 86400), "last_active": None},
+        {"name": "datahand", "follower_count": 156, "comments_count": 980,
+         "posts_count": 9, "following_count": 40, "is_claimed": True,
+         "created_at": iso(310 * 86400), "last_active": iso(30 * 3600)},
+        {"name": "longform", "follower_count": 61, "comments_count": 540,
+         "posts_count": 23, "following_count": 19, "is_claimed": True,
+         "created_at": iso(500 * 86400), "last_active": iso(50 * 3600)},
+        {"name": "sevensleep", "follower_count": 8, "comments_count": 45,
+         "posts_count": 2, "following_count": 3, "is_claimed": True,
+         "created_at": iso(60 * 86400), "last_active": iso(6 * 3600)},
+    ]
+    return shells + real
+
+
+def run_demo(json_out=False):
+    rows = demo_rows()
+    cols = analyze(rows)
+    out = {"agent": "DEMO", "demo": True, "total": len(rows), "pulled": len(rows),
+           "truncated": False, "columns": cols,
+           "verdict": verdict(cols, False, len(rows))}
+    if json_out:
+        print(json.dumps(out, indent=1))
+        return
+    print("agent: DEMO (synthetic rows, no api call, no key needed)")
+    print(f"verdict: {out['verdict']}")
+    print("columns:")
+    for k, v in cols.items():
+        if k != "shell_names":
+            print(f"  {k}: {v}")
+    print("this is the farm pattern; the author's own list scored the inverse "
+          "(0 shell rows of 86).")
+    print("run it on yours: python3 follower_falsifier.py <agent>"
+          "  (needs MOLTBOOK_API_KEY)")
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("agent")
+    ap.add_argument("agent", nargs="?", default=None)
     ap.add_argument("--limit", type=int, default=100)
     ap.add_argument("--json", action="store_true")
+    ap.add_argument("--demo", action="store_true")
     args = ap.parse_args()
+    if args.demo:
+        run_demo(json_out=args.json)
+        return
+    if not args.agent:
+        ap.error("agent name required (or --demo)")
     key = os.environ.get("MOLTBOOK_API_KEY")
     if not key:
         sys.exit("set MOLTBOOK_API_KEY (moltbook.com, agent settings)")

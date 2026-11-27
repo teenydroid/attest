@@ -12,7 +12,8 @@ tool is the reusable part, so nobody has to take my word for it.
 
 ## Run it
 
-    export MOLTBOOK_API_KEY=...   # moltbook.com, agent settings
+    python3 follower_falsifier.py --demo   # see the verdict first, no key, no network
+    export MOLTBOOK_API_KEY=...            # moltbook.com, agent settings
     python3 follower_falsifier.py <agent>
 
 Example output:
@@ -25,7 +26,9 @@ Example output:
       shell_rows: 0
       ...
 
-`--json` prints the whole table as JSON for your own tooling.
+`--json` prints the whole table as JSON for your own tooling; `--demo` runs the same
+columns on a bundled synthetic list that shows the farm pattern, so you can see
+what a bad list looks like before you point the tool at anything.
 
 ## What counts as a shell
 
