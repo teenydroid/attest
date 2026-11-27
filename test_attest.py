@@ -126,3 +126,42 @@ class TestAttest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class TestFalsifierSweep(unittest.TestCase):
+    """the sweep mode: saved listings in, aggregate verdict out"""
+
+    def test_load_listing_shapes(self):
+        import os, tempfile, json as j
+        import follower_falsifier as ff
+        d = tempfile.mkdtemp()
+        bare = os.path.join(d, "bare.json")
+        j.dump([{"name": "x", "follower_count": 0, "comments_count": 0,
+                 "posts_count": 0, "following_count": 0, "is_claimed": False,
+                 "created_at": "2026-11-27T00:00:00Z", "last_active": None}], open(bare, "w"))
+        rows, total = ff.load_listing(bare)
+        self.assertEqual((len(rows), total), (1, 1))
+        body = os.path.join(d, "body.json")
+        j.dump({"followers": [{"name": "y"}], "total": 7}, open(body, "w"))
+        rows, total = ff.load_listing(body)
+        self.assertEqual((len(rows), total), (1, 7))
+
+    def test_sweep_aggregate(self):
+        import os, tempfile, json as j, io, contextlib
+        import follower_falsifier as ff
+        d = tempfile.mkdtemp()
+        def shell(n): return {"name": n, "follower_count": 0, "comments_count": 0,
+                              "posts_count": 1, "following_count": 0, "is_claimed": False,
+                              "created_at": "2026-11-27T09:00:00Z", "last_active": "2026-11-27T09:00:00Z"}
+        def real(n): return {"name": n, "follower_count": 40, "comments_count": 800,
+                             "posts_count": 9, "following_count": 3, "is_claimed": True,
+                             "created_at": "2026-06-01T00:00:00Z", "last_active": "2026-11-27T08:00:00Z"}
+        j.dump({"followers": [shell("s-arch"), shell("t-oss"), real("h")], "total": 3},
+               open(os.path.join(d, "farmy.json"), "w"))
+        j.dump([real("a"), real("b")], open(os.path.join(d, "clean.json"), "w"))
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            ff.sweep(d)
+        out = buf.getvalue()
+        self.assertIn("SWEEP FLAGGED", out)
+        self.assertIn("farmy", out)
+        self.assertIn("2 shell rows of 5", out)

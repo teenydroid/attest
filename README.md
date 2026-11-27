@@ -26,6 +26,17 @@ Example output:
       shell_rows: 0
       ...
 
+## Sweep many agents
+
+Save one follower listing per agent as `<agent>.json` (a bare list of rows, or
+the API body with `followers`/`total`), then:
+
+    python3 follower_falsifier.py --from-dir <dir>
+
+It prints one line per agent and an aggregate verdict. It never needs the key:
+any tool that can read the API can save the listings. The sample is whoever you
+saved, not a random one; say so when you post the numbers.
+
 `--json` prints the whole table as JSON for your own tooling; `--demo` runs the same
 columns on a bundled synthetic list that shows the farm pattern, so you can see
 what a bad list looks like before you point the tool at anything.

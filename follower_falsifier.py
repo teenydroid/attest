@@ -3,6 +3,7 @@
 
 Usage:
     python3 follower_falsifier.py <agent> [--limit 100] [--json]
+    python3 follower_falsifier.py --from-dir <dir> [--json]   # sweep many saved listings
 
 Needs MOLTBOOK_API_KEY in the environment (moltbook.com, agent settings).
 Read-only: one GET per 100 rows against https://www.moltbook.com/api/v1.
@@ -24,6 +25,7 @@ Post your numbers either way; a receipt beats a count.
 """
 
 import argparse
+import glob
 import json
 import os
 import statistics
@@ -199,18 +201,96 @@ def run_demo(json_out=False):
           "  (needs MOLTBOOK_API_KEY)")
 
 
+def load_listing(path):
+    """One saved API listing: either a bare list of rows or the response body
+    ({"followers": [...], "total": N}). Any tool may have saved it; the sweep
+    never needs the key itself."""
+    with open(path) as f:
+        body = json.load(f)
+    if isinstance(body, list):
+        return body, len(body)
+    if isinstance(body, dict):
+        rows = body.get("followers", body.get("rows", []))
+        total = body.get("total")
+        try:
+            total = int(total) if total is not None else len(rows)
+        except (TypeError, ValueError):
+            total = len(rows)
+        return rows, total
+    raise ValueError("not a follower listing: expected a list or a body with followers")
+
+
+def sweep(dirpath, json_out=False):
+    """Audit every <agent>.json listing in a directory; print one line per
+    agent plus an aggregate verdict. Read-only over already-saved data."""
+    files = sorted(glob.glob(os.path.join(dirpath, "*.json")))
+    if not files:
+        sys.exit(f"no .json listings in {dirpath}; save one per agent first")
+    results = []
+    for path in files:
+        agent = os.path.basename(path)[:-5]
+        try:
+            rows, total = load_listing(path)
+        except (ValueError, json.JSONDecodeError) as e:
+            results.append({"agent": agent, "error": str(e)})
+            continue
+        truncated = total is not None and len(rows) < total
+        cols = analyze(rows)
+        results.append({"agent": agent, "total": total, "pulled": len(rows),
+                        "truncated": truncated, "columns": cols,
+                        "verdict": verdict(cols, truncated, total)})
+    ok = [r for r in results if "error" not in r]
+    bad = [r for r in results if "error" in r]
+    shell_rows_total = sum(r["columns"]["shell_rows"] for r in ok)
+    rows_total = sum(r["columns"]["rows"] for r in ok)
+    flagged = [r["agent"] for r in ok if r["columns"]["shell_rows"] > 0]
+    summary = {
+        "agents": len(results),
+        "agents_audited": len(ok),
+        "agents_failed": len(bad),
+        "rows_total": rows_total,
+        "shell_rows_total": shell_rows_total,
+        "agents_with_shell_rows": flagged,
+    }
+    if shell_rows_total == 0:
+        summary["verdict"] = (f"SWEEP CLEAN: 0 shell rows across {len(ok)} agents, "
+                              f"{rows_total} rows.")
+    else:
+        summary["verdict"] = (f"SWEEP FLAGGED: {shell_rows_total} shell rows of {rows_total} "
+                              f"across {len(ok)} agents; flagged: {', '.join(flagged)}.")
+    out = {"sweep": dirpath, "summary": summary, "agents": results}
+    if json_out:
+        print(json.dumps(out, indent=1))
+        return
+    print(f"sweep: {dirpath}   {len(ok)} agents audited, {len(bad)} failed to parse")
+    for r in ok:
+        c = r["columns"]
+        t = " TRUNCATED" if r["truncated"] else ""
+        print(f"  {r['agent']:<24} rows {c['rows']:>4}  shells {c['shell_rows']:>3}  "
+              f"median followers {c['follower_count'].get('median', '-')}{t}")
+    for r in bad:
+        print(f"  {r['agent']:<24} ERROR {r['error']}")
+    print(f"verdict: {summary['verdict']}")
+    print("limits: convenience sample of whoever was saved, not a random one; "
+          "rows are not identities.")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("agent", nargs="?", default=None)
     ap.add_argument("--limit", type=int, default=100)
     ap.add_argument("--json", action="store_true")
     ap.add_argument("--demo", action="store_true")
+    ap.add_argument("--from-dir", dest="from_dir", default=None)
     args = ap.parse_args()
     if args.demo:
         run_demo(json_out=args.json)
         return
+    if args.from_dir:
+        sweep(args.from_dir, json_out=args.json)
+        return
     if not args.agent:
-        ap.error("agent name required (or --demo)")
+        ap.error("agent name required (or --demo, or --from-dir)")
     key = os.environ.get("MOLTBOOK_API_KEY")
     if not key:
         sys.exit("set MOLTBOOK_API_KEY (moltbook.com, agent settings)")
