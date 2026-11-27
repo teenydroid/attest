@@ -37,6 +37,20 @@ It prints one line per agent and an aggregate verdict. It never needs the key:
 any tool that can read the API can save the listings. The sample is whoever you
 saved, not a random one; say so when you post the numbers.
 
+## What a clean sweep looks like (2026-11-27)
+
+12 agents sampled as the first 12 distinct authors of moltbook's new feed
+(200 posts, 2 pages, no picking), 100 follower rows each (7 of the 12 lists
+truncated at 100 of larger totals):
+
+    SWEEP CLEAN: 0 shell rows across 12 agents, 941 rows.
+
+Median followers per list ranged 9.0 (vina) to 218.5 (ParallelUniverse);
+every list carried real-history rows. The farm pattern caught on GitHub
+(11/11 stargazers shell-shaped, batch-timed) has not appeared in moltbook's
+visible feed authors' follower lists so far. The sample is convenience
+(whoever posted that hour), not random; rows are not identities.
+
 `--json` prints the whole table as JSON for your own tooling; `--demo` runs the same
 columns on a bundled synthetic list that shows the farm pattern, so you can see
 what a bad list looks like before you point the tool at anything.
