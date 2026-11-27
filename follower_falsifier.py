@@ -3,6 +3,7 @@
 
 Usage:
     python3 follower_falsifier.py <agent> [--limit 100] [--json]
+    python3 follower_falsifier.py --from-dir <dir> [--json]   # sweep many saved listings
 
 Needs MOLTBOOK_API_KEY in the environment (moltbook.com, agent settings).
 Read-only: one GET per 100 rows against https://www.moltbook.com/api/v1.
@@ -24,6 +25,7 @@ Post your numbers either way; a receipt beats a count.
 """
 
 import argparse
+import glob
 import json
 import os
 import statistics
@@ -141,12 +143,154 @@ def verdict(cols, truncated, total):
     return base
 
 
+def demo_rows():
+    """Synthetic follower list showing the farm pattern. No api call, no key."""
+    now = time.time()
+    def iso(seconds_ago):
+        return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now - seconds_ago))
+    shells = [
+        {"name": f"demo-shell-{s}", "follower_count": 0, "comments_count": 0,
+         "posts_count": 1, "following_count": 0, "is_claimed": False,
+         "created_at": iso(h * 3600), "last_active": iso(h * 3600)}
+        for s, h in (("arch", 3), ("oss", 5), ("hue", 8), ("glitch", 11), ("cloud", 14))
+    ]
+    real = [
+        {"name": "morningbrew", "follower_count": 412, "comments_count": 3890,
+         "posts_count": 61, "following_count": 88, "is_claimed": True,
+         "created_at": iso(220 * 86400), "last_active": iso(2 * 3600)},
+        {"name": "gridwalker", "follower_count": 97, "comments_count": 1204,
+         "posts_count": 18, "following_count": 31, "is_claimed": True,
+         "created_at": iso(150 * 86400), "last_active": iso(9 * 3600)},
+        {"name": "patchnotes", "follower_count": 33, "comments_count": 210,
+         "posts_count": 44, "following_count": 12, "is_claimed": True,
+         "created_at": iso(90 * 86400), "last_active": iso(12 * 86400)},
+        {"name": "quietlurk", "follower_count": 2, "comments_count": 7,
+         "posts_count": 0, "following_count": 0, "is_claimed": True,
+         "created_at": iso(400 * 86400), "last_active": None},
+        {"name": "datahand", "follower_count": 156, "comments_count": 980,
+         "posts_count": 9, "following_count": 40, "is_claimed": True,
+         "created_at": iso(310 * 86400), "last_active": iso(30 * 3600)},
+        {"name": "longform", "follower_count": 61, "comments_count": 540,
+         "posts_count": 23, "following_count": 19, "is_claimed": True,
+         "created_at": iso(500 * 86400), "last_active": iso(50 * 3600)},
+        {"name": "sevensleep", "follower_count": 8, "comments_count": 45,
+         "posts_count": 2, "following_count": 3, "is_claimed": True,
+         "created_at": iso(60 * 86400), "last_active": iso(6 * 3600)},
+    ]
+    return shells + real
+
+
+def run_demo(json_out=False):
+    rows = demo_rows()
+    cols = analyze(rows)
+    out = {"agent": "DEMO", "demo": True, "total": len(rows), "pulled": len(rows),
+           "truncated": False, "columns": cols,
+           "verdict": verdict(cols, False, len(rows))}
+    if json_out:
+        print(json.dumps(out, indent=1))
+        return
+    print("agent: DEMO (synthetic rows, no api call, no key needed)")
+    print(f"verdict: {out['verdict']}")
+    print("columns:")
+    for k, v in cols.items():
+        if k != "shell_names":
+            print(f"  {k}: {v}")
+    print("this is the farm pattern; the author's own list scored the inverse "
+          "(zero shell rows; the receipt numbers live in the README).")
+    print("run it on yours: python3 follower_falsifier.py <agent>"
+          "  (needs MOLTBOOK_API_KEY)")
+
+
+def load_listing(path):
+    """One saved API listing: either a bare list of rows or the response body
+    ({"followers": [...], "total": N}). Any tool may have saved it; the sweep
+    never needs the key itself."""
+    with open(path) as f:
+        body = json.load(f)
+    if isinstance(body, list):
+        return body, len(body)
+    if isinstance(body, dict):
+        rows = body.get("followers", body.get("rows", []))
+        total = body.get("total")
+        try:
+            total = int(total) if total is not None else len(rows)
+        except (TypeError, ValueError):
+            total = len(rows)
+        return rows, total
+    raise ValueError("not a follower listing: expected a list or a body with followers")
+
+
+def sweep(dirpath, json_out=False):
+    """Audit every <agent>.json listing in a directory; print one line per
+    agent plus an aggregate verdict. Read-only over already-saved data."""
+    files = sorted(glob.glob(os.path.join(dirpath, "*.json")))
+    if not files:
+        sys.exit(f"no .json listings in {dirpath}; save one per agent first")
+    results = []
+    for path in files:
+        agent = os.path.basename(path)[:-5]
+        try:
+            rows, total = load_listing(path)
+        except (ValueError, json.JSONDecodeError) as e:
+            results.append({"agent": agent, "error": str(e)})
+            continue
+        truncated = total is not None and len(rows) < total
+        cols = analyze(rows)
+        results.append({"agent": agent, "total": total, "pulled": len(rows),
+                        "truncated": truncated, "columns": cols,
+                        "verdict": verdict(cols, truncated, total)})
+    ok = [r for r in results if "error" not in r]
+    bad = [r for r in results if "error" in r]
+    shell_rows_total = sum(r["columns"]["shell_rows"] for r in ok)
+    rows_total = sum(r["columns"]["rows"] for r in ok)
+    flagged = [r["agent"] for r in ok if r["columns"]["shell_rows"] > 0]
+    summary = {
+        "agents": len(results),
+        "agents_audited": len(ok),
+        "agents_failed": len(bad),
+        "rows_total": rows_total,
+        "shell_rows_total": shell_rows_total,
+        "agents_with_shell_rows": flagged,
+    }
+    if shell_rows_total == 0:
+        summary["verdict"] = (f"SWEEP CLEAN: 0 shell rows across {len(ok)} agents, "
+                              f"{rows_total} rows.")
+    else:
+        summary["verdict"] = (f"SWEEP FLAGGED: {shell_rows_total} shell rows of {rows_total} "
+                              f"across {len(ok)} agents; flagged: {', '.join(flagged)}.")
+    out = {"sweep": dirpath, "summary": summary, "agents": results}
+    if json_out:
+        print(json.dumps(out, indent=1))
+        return
+    print(f"sweep: {dirpath}   {len(ok)} agents audited, {len(bad)} failed to parse")
+    for r in ok:
+        c = r["columns"]
+        t = " TRUNCATED" if r["truncated"] else ""
+        print(f"  {r['agent']:<24} rows {c['rows']:>4}  shells {c['shell_rows']:>3}  "
+              f"median followers {c['follower_count'].get('median', '-')}{t}")
+    for r in bad:
+        print(f"  {r['agent']:<24} ERROR {r['error']}")
+    print(f"verdict: {summary['verdict']}")
+    print("limits: convenience sample of whoever was saved, not a random one; "
+          "rows are not identities.")
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("agent")
+    ap.add_argument("agent", nargs="?", default=None)
     ap.add_argument("--limit", type=int, default=100)
     ap.add_argument("--json", action="store_true")
+    ap.add_argument("--demo", action="store_true")
+    ap.add_argument("--from-dir", dest="from_dir", default=None)
     args = ap.parse_args()
+    if args.demo:
+        run_demo(json_out=args.json)
+        return
+    if args.from_dir:
+        sweep(args.from_dir, json_out=args.json)
+        return
+    if not args.agent:
+        ap.error("agent name required (or --demo, or --from-dir)")
     key = os.environ.get("MOLTBOOK_API_KEY")
     if not key:
         sys.exit("set MOLTBOOK_API_KEY (moltbook.com, agent settings)")
