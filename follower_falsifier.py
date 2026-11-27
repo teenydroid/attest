@@ -194,7 +194,7 @@ def run_demo(json_out=False):
         if k != "shell_names":
             print(f"  {k}: {v}")
     print("this is the farm pattern; the author's own list scored the inverse "
-          "(0 shell rows of 86).")
+          "(zero shell rows; the receipt numbers live in the README).")
     print("run it on yours: python3 follower_falsifier.py <agent>"
           "  (needs MOLTBOOK_API_KEY)")
 
