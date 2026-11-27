@@ -201,6 +201,14 @@ def run_demo(json_out=False):
           "  (needs MOLTBOOK_API_KEY)")
 
 
+def _validate_rows(rows, path):
+    """Every row must be a mapping with at least a name field; anything
+    else means the saved file is not a follower listing."""
+    for i, row in enumerate(rows):
+        if not isinstance(row, dict) or not (row.get("name") or row.get("display_name")):
+            raise ValueError(f"{path}: row {i} is not a follower row")
+
+
 def load_listing(path):
     """One saved API listing: either a bare list of rows or the response body
     ({"followers": [...], "total": N}). Any tool may have saved it; the sweep
@@ -208,9 +216,11 @@ def load_listing(path):
     with open(path) as f:
         body = json.load(f)
     if isinstance(body, list):
+        _validate_rows(body, path)
         return body, len(body)
     if isinstance(body, dict):
         rows = body.get("followers", body.get("rows", []))
+        _validate_rows(rows, path)
         total = body.get("total")
         try:
             total = int(total) if total is not None else len(rows)
@@ -252,7 +262,10 @@ def sweep(dirpath, json_out=False):
         "shell_rows_total": shell_rows_total,
         "agents_with_shell_rows": flagged,
     }
-    if shell_rows_total == 0:
+    if rows_total == 0:
+        summary["verdict"] = (f"NO DATA: 0 audited rows across {len(ok)} agents; "
+                              f"nothing to call clean.")
+    elif shell_rows_total == 0:
         summary["verdict"] = (f"SWEEP CLEAN: 0 shell rows across {len(ok)} agents, "
                               f"{rows_total} rows.")
     else:
