@@ -23,6 +23,9 @@ Checks, in order:
      parent_id (the 09:1xZ twin-run case dies here).
   7. body: non-empty, no control characters.
   8. expiry: ISO date, in the future, at most 7 days out.
+  9. count gap: the post's comment_count vs rows the listing serves. A
+     gap is the silent-truncation specimen (post says 30, listing serves
+     28): the verdict downgrades to CAUTION and the gap is named.
 
 Usage:
   python3 tools/dispcheck.py --draft work/tmp/disp-x.json [--listing f.json]
@@ -34,6 +37,7 @@ Reads only: `bin/teeny call` GETs and `bin/teeny dispatches`. Never writes.
 """
 import argparse
 import json
+import os
 import re
 import subprocess
 import sys
@@ -44,11 +48,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from moltbook_ids import ME, UUID_RE, mb_call, resolve_post_id
 
 CTRL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
+#: the broker hand; TEENY_BIN overrides for runs outside home
+TEENY = os.environ.get("TEENY_BIN", "bin/teeny")
 MAX_AGE_DAYS = 7
 
 
 def dispatches():
-    p = subprocess.run(["bin/teeny", "dispatches", '{"days": 14}'],
+    p = subprocess.run([TEENY, "dispatches", '{"days": 14}'],
                        capture_output=True, text=True, timeout=60)
     try:
         d = json.loads(p.stdout)
@@ -66,15 +72,20 @@ def my_comments():
     return j.get("comments", j.get("items", []))
 
 
-def check(draft, listing, ledger, mine):
+def check(draft, listing, ledger, mine, today=None, listing_meta=None,
+          resolve=None):
     defects, notes = [], []
+    cautions = []
+    if today is None:
+        today = datetime.now(timezone.utc).date()
+    resolve = resolve or resolve_post_id
 
     def bad(msg):
         defects.append(msg)
 
     if not isinstance(draft, dict):
         bad("draft is not a json object")
-        return defects, notes
+        return defects, notes, cautions
     if draft.get("do") != "dispatch_moltbook":
         bad(f"do is {draft.get('do')!r}, expected dispatch_moltbook")
     for key in ("post_id", "parent_id", "why"):
@@ -86,29 +97,31 @@ def check(draft, listing, ledger, mine):
     post_id = draft.get("post_id", "")
     parent_id = draft.get("parent_id", "")
     try:
-        post_id = resolve_post_id(post_id)
+        post_id = resolve(post_id)
         if post_id != draft.get("post_id"):
             notes.append(f"post_id resolved to whole uuid {post_id}")
+            draft["post_id"] = post_id
     except (ValueError, RuntimeError) as e:
         bad(f"post_id unresolvable: {e}")
     try:
-        parent_id = resolve_post_id(parent_id)
+        parent_id = resolve(parent_id)
         if parent_id != draft.get("parent_id"):
             notes.append(f"parent_id resolved to whole uuid {parent_id}")
+            draft["parent_id"] = parent_id
     except (ValueError, RuntimeError) as e:
         bad(f"parent_id unresolvable: {e}")
     if defects:
-        return defects, notes
+        return defects, notes, cautions
 
     if listing is None:
         d = mb_call(f"/posts/{post_id}/comments", {"limit": 100, "page": 1})
         if d.get("status") != "ok":
             bad(f"comment listing fetch failed: {json.dumps(d)[:200]}")
-            return defects, notes
+            return defects, notes, cautions
         listing = d.get("result", {}).get("json", {}).get("comments", [])
     if not listing:
         bad("comment listing is empty: parent cannot be a member of it")
-        return defects, notes
+        return defects, notes, cautions
     ids = [c.get("id") for c in listing]
     off_post = [c.get("id") for c in listing if c.get("post_id") not in (None, post_id)]
     if off_post:
@@ -149,21 +162,38 @@ def check(draft, listing, ledger, mine):
     if CTRL_RE.search(body):
         bad("body holds control characters")
 
+    # 9. count gap: post's comment_count vs rows the listing serves
+    if listing_meta is not None and listing_meta.get("unverified"):
+        cautions.append(f"count gap UNVERIFIED: {listing_meta['unverified']}; "
+                        f"treat the thread count as unknown")
+    elif listing_meta:
+        declared = listing_meta.get("comment_count")
+        served = listing_meta.get("served")
+        if isinstance(declared, int) and isinstance(served, int) and declared > served:
+            cautions.append(
+                f"count gap: post declares {declared} comments, listing served "
+                f"{served} - the difference is real rows this listing cannot "
+                f"show; treat the thread as unverified")
+    elif listing_meta is not None:
+        notes.append("listing carries no comment_count; count-gap check skipped")
+
     exp = draft.get("expires_at")
     if exp:
         try:
-            ed = date.fromisoformat(str(exp)[:10])
+            m = re.fullmatch(r"(\d{4}-\d{2}-\d{2})(T\d{2}:\d{2}:\d{2}Z)?", str(exp))
+            if not m:
+                raise ValueError
+            ed = date.fromisoformat(m.group(1))
         except ValueError:
             bad(f"expires_at {exp!r} is not YYYY-MM-DD")
         else:
-            today = datetime.now(timezone.utc).date()
             if ed < today:
                 bad(f"expires_at {ed} is in the past")
             elif ed > today + timedelta(days=MAX_AGE_DAYS):
                 bad(f"expires_at {ed} is more than {MAX_AGE_DAYS} days out")
     else:
         notes.append("no expires_at in draft")
-    return defects, notes
+    return defects, notes, cautions
 
 
 def selftest():
@@ -176,40 +206,66 @@ def selftest():
         base.update(kw)
         return base
 
+    def fake_resolve(pid):
+        if UUID_RE.match(pid):
+            return pid
+        raise ValueError(f"no comment of mine carries post id {pid!r}")
+
+    def chk(*args, **kw):
+        kw.setdefault("resolve", fake_resolve)
+        return check(*args, **kw)
+
     listing = [{"id": draft()["parent_id"], "post_id": draft()["post_id"],
                 "is_deleted": False, "is_spam": False,
                 "author": {"name": "stranger"}, "created_at": "2026-11-27T01:00:00Z"}]
-    d, n = check(draft(), listing, [], [])
-    ok.append(("clean draft passes", d == []))
-    d, _ = check(draft(do="comment_moltbook"), listing, [], [])
+    TODAY = date(2026, 11, 27)
+    d, n, c = chk(draft(), listing, [], [], today=TODAY)
+    ok.append(("clean draft passes", d == [] and c == []))
+    d, n, c = chk(draft(), listing, [], [], today=TODAY,
+                    listing_meta={"comment_count": 30, "served": 28})
+    ok.append(("count gap flagged", any("count gap" in x for x in c)))
+    d, n, c = chk(draft(), listing, [], [], today=TODAY,
+                    listing_meta={"comment_count": 1, "served": 1})
+    ok.append(("no gap no caution", c == []))
+    d, n, c = chk(draft(), listing, [], [], today=TODAY,
+                    listing_meta={})
+    ok.append(("missing count noted", any("no comment_count" in x for x in n)))
+    d, n, c = chk(draft(), listing, [], [], today=TODAY,
+                    listing_meta={"unverified": "post fetch refused: cap"})
+    ok.append(("unverified count cautions", any("UNVERIFIED" in x for x in c)))
+    d, _, _ = chk(draft(do="comment_moltbook"), listing, [], [], today=TODAY)
     ok.append(("wrong do fails", any("do is" in x for x in d)))
-    d, _ = check(draft(parent_id="deadbeef"), listing, [], [])
+    d, _, _ = chk(draft(parent_id="deadbeef"), listing, [], [], today=TODAY)
     ok.append(("short parent id fails shape", any("parent_id" in x for x in d)))
-    d, _ = check(draft(parent_id="c" * 8 + "-1111-2222-3333-444455556666"), listing, [], [])
+    d, _, _ = chk(draft(parent_id="c" * 8 + "-1111-2222-3333-444455556666"), listing, [], [], today=TODAY)
     ok.append(("absent parent fails membership", any("not in" in x for x in d)))
     mine = [{"id": "d" * 8 + "-1111-2222-3333-444455556666", "parent_id": draft()["parent_id"],
              "created_at": "2026-11-26T00:00:00Z"}]
-    d, _ = check(draft(), listing, [], mine)
+    d, _, _ = chk(draft(), listing, [], mine, today=TODAY)
     ok.append(("platform duplicate caught", any("platform duplicate" in x for x in d)))
     ledger = [{"id": 37, "status": "pending", "filed_at": "2026-11-27T09:01:06Z",
                "parent_id": draft()["parent_id"]}]
-    d, _ = check(draft(), listing, ledger, [])
+    d, _, _ = chk(draft(), listing, ledger, [], today=TODAY)
     ok.append(("ledger duplicate caught", any("ledger duplicate" in x for x in d)))
     own = [dict(listing[0], author={"name": ME})]
-    d, _ = check(draft(), own, [], [])
+    d, _, _ = chk(draft(), own, [], [], today=TODAY)
     ok.append(("own-ground caught", any("own ground" in x for x in d)))
-    d, _ = check(draft(body=""), listing, [], [])
+    d, _, _ = chk(draft(body=""), listing, [], [], today=TODAY)
     ok.append(("empty body caught", any("body is empty" in x for x in d)))
-    d, _ = check(draft(body="x\x07y"), listing, [], [])
+    d, _, _ = chk(draft(body="x\x07y"), listing, [], [], today=TODAY)
     ok.append(("control char caught", any("control characters" in x for x in d)))
-    d, _ = check(draft(expires_at="2026-11-20"), listing, [], [])
+    d, _, _ = chk(draft(expires_at="2026-11-20"), listing, [], [], today=TODAY)
     ok.append(("past expiry caught", any("past" in x for x in d)))
-    d, _ = check(draft(expires_at="2026-12-20"), listing, [], [])
+    d, _, _ = chk(draft(expires_at="2026-12-20"), listing, [], [], today=TODAY)
     ok.append(("far expiry caught", any("more than" in x for x in d)))
-    d, _ = check(draft(expires_at="not-a-date"), listing, [], [])
+    d, _, _ = chk(draft(expires_at="not-a-date"), listing, [], [], today=TODAY)
     ok.append(("bad expiry caught", any("not YYYY-MM-DD" in x for x in d)))
+    d, _, _ = chk(draft(expires_at="2026-12-04T11:00:00Z"), listing, [], [], today=TODAY)
+    ok.append(("full ISO timestamp passes", d == []))
+    d, _, _ = chk(draft(expires_at="2026-12-03invalid"), listing, [], [], today=TODAY)
+    ok.append(("expiry suffix caught", any("not YYYY-MM-DD" in x for x in d)))
     gone = [dict(listing[0], is_deleted=True)]
-    d, _ = check(draft(), gone, [], [])
+    d, _, _ = chk(draft(), gone, [], [], today=TODAY)
     ok.append(("deleted parent caught", any("deleted" in x for x in d)))
     failed = [name for name, passed in ok if not passed]
     for name, passed in ok:
@@ -238,25 +294,57 @@ def main():
         print(f"bad input: cannot read draft: {e}", file=sys.stderr)
         sys.exit(2)
     listing = None
+    listing_meta = None
     if a.listing:
         raw = json.load(open(a.listing))
-        listing = raw.get("result", {}).get("json", {}).get("comments", raw if isinstance(raw, list) else [])
+        if isinstance(raw, list):
+            listing = raw
+        else:
+            j = raw.get("result", {}).get("json", raw)
+            if isinstance(j, list):
+                listing = j
+            else:
+                listing = j.get("comments", [])
+                listing_meta = {"comment_count": j.get("comment_count", j.get("count")),
+                                "served": len(listing)}
+    # declared count comes from the post object itself (the silent-truncation
+    # specimen lives exactly there: post says N, listing serves M < N)
+    post_meta = None
+    post_fetch_note = None
+    pid = draft.get("post_id") or ""
+    if re.fullmatch(UUID_RE, pid):
+        pd = mb_call(f"/posts/{pid}", {})
+        if isinstance(pd, dict) and pd.get("status") == "ok":
+            post_meta = (pd.get("result", {}).get("json", {}) or {})
+        else:
+            post_fetch_note = json.dumps(pd.get("result", pd))[:160]
     ledger = dispatches()
     if ledger is None:
         print("warn: dispatches ledger unreadable; ledger-duplicate check skipped")
     mine = my_comments()
     if mine is None:
         print("warn: my-comments fetch failed; platform-duplicate check skipped")
-    defects, notes = check(draft, listing, ledger, mine)
+    if post_meta and isinstance(post_meta.get("comment_count"), int):
+        served = len(listing) if listing is not None else None
+        listing_meta = {"comment_count": post_meta["comment_count"], "served": served} if served is not None else {}
+    elif post_fetch_note:
+        listing_meta = {"unverified": f"post fetch refused, count-gap check could not run: {post_fetch_note}"}
+    defects, notes, cautions = check(draft, listing, ledger, mine, listing_meta=listing_meta)
     for n in notes:
         print(f"note: {n}")
+    for c in cautions:
+        print(f"CAUTION: {c}")
     if defects:
         for d in defects:
             print(f"DEFECT: {d}")
         print(f"verdict: FAIL ({len(defects)} defect(s)); nothing written, hand not called")
         sys.exit(1)
-    print("verdict: PASS - ids whole, parent live and not mine, no duplicate on the "
-          "thread or in the ledger, body clean, expiry in window")
+    if cautions:
+        print("verdict: CAUTION - ids whole, no duplicate, but the listing is "
+              "short of the post's own count; see above")
+    else:
+        print("verdict: PASS - ids whole, parent live and not mine, no duplicate on the "
+              "thread or in the ledger, body clean, expiry in window, count gap none")
     if a.spec_out:
         Path(a.spec_out).write_text(json.dumps(draft, indent=2) + "\n")
         print(f"spec written: {a.spec_out}")
