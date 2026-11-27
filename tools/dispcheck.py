@@ -11,8 +11,10 @@ This tool reads all three and fails loudly BEFORE `bin/teeny do` is called.
 
 Checks, in order:
   1. draft shape: do == "dispatch_moltbook", post_id, parent_id, body, why.
-  2. id shape: post_id/parent_id whole 36-char uuids (short ids resolved
-     via moltbook_ids.resolve_post_id, loud on no match).
+  2. id shape: post_id a whole 36-char uuid (short ids resolved via
+     moltbook_ids.resolve_post_id, loud on no match); parent_id a whole
+     uuid or a short comment id resolved against the post's own comment
+     listing (ambiguous or unmatched = defect).
   3. membership: parent_id appears verbatim in the post's comment listing
      (fresh GET, or --listing file); the listing's comments sit on post_id.
   4. parent state: exists, not deleted, not spam, author is not teenydroid
@@ -93,6 +95,12 @@ def check(draft, listing, ledger, mine, today=None, listing_meta=None,
             bad(f"missing draft key: {key}")
     if "body" not in draft or draft["body"] is None:
         bad("missing draft key: body")
+    for key in ("post_id", "parent_id", "body", "why"):
+        v = draft.get(key)
+        if v is not None and not isinstance(v, str):
+            bad(f"{key} is {type(v).__name__}, not a string")
+    if defects:
+        return defects, notes, cautions
 
     post_id = draft.get("post_id", "")
     parent_id = draft.get("parent_id", "")
@@ -103,25 +111,45 @@ def check(draft, listing, ledger, mine, today=None, listing_meta=None,
             draft["post_id"] = post_id
     except (ValueError, RuntimeError) as e:
         bad(f"post_id unresolvable: {e}")
-    try:
-        parent_id = resolve(parent_id)
-        if parent_id != draft.get("parent_id"):
-            notes.append(f"parent_id resolved to whole uuid {parent_id}")
-            draft["parent_id"] = parent_id
-    except (ValueError, RuntimeError) as e:
-        bad(f"parent_id unresolvable: {e}")
+    short_parent = None
+    if UUID_RE.match(parent_id):
+        pass
+    else:
+        short_parent = parent_id
+        parent_id = ""
     if defects:
         return defects, notes, cautions
 
     if listing is None:
-        d = mb_call(f"/posts/{post_id}/comments", {"limit": 100, "page": 1})
-        if d.get("status") != "ok":
-            bad(f"comment listing fetch failed: {json.dumps(d)[:200]}")
-            return defects, notes, cautions
-        listing = d.get("result", {}).get("json", {}).get("comments", [])
+        listing, page = [], 1
+        while page <= 5:  # cap: reads are capped too
+            d = mb_call(f"/posts/{post_id}/comments", {"limit": 100, "page": page})
+            if d.get("status") != "ok":
+                bad(f"comment listing fetch failed: {json.dumps(d)[:200]}")
+                return defects, notes, cautions
+            batch = d.get("result", {}).get("json", {}).get("comments", [])
+            listing.extend(batch)
+            if len(batch) < 100:
+                break
+            page += 1
+        if page > 5:
+            cautions.append(f"listing walked 5 pages ({len(listing)} comments) and "
+                            f"stopped on cap; later pages unread")
     if not listing:
         bad("comment listing is empty: parent cannot be a member of it")
         return defects, notes, cautions
+    if short_parent is not None:
+        hits = [c.get("id") for c in listing
+                if isinstance(c.get("id"), str) and c.get("id").startswith(short_parent)]
+        if len(hits) == 1:
+            parent_id = hits[0]
+            notes.append(f"parent_id resolved to whole uuid {parent_id}")
+            draft["parent_id"] = parent_id
+        elif len(hits) > 1:
+            bad(f"parent_id {short_parent!r} matches {len(hits)} comments; ambiguous")
+        else:
+            bad(f"parent_id {short_parent!r} matches no comment in the listing")
+
     ids = [c.get("id") for c in listing]
     off_post = [c.get("id") for c in listing if c.get("post_id") not in (None, post_id)]
     if off_post:
@@ -142,19 +170,30 @@ def check(draft, listing, ledger, mine, today=None, listing_meta=None,
         else:
             notes.append(f"parent author: {author}")
 
-    if mine is not None:
-        for c in mine:
-            if c.get("parent_id") == parent_id or c.get("parent") == parent_id:
-                bad(f"platform duplicate: my comment {c.get('id')} already "
-                    f"sits under {parent_id} ({c.get('created_at')})")
-                break
-
-    if ledger is not None:
+    if ledger is None:
+        cautions.append("ledger duplicate check unavailable: dispatches ledger unreadable")
+    else:
         for x in ledger:
             if x.get("parent_id") == parent_id and x.get("status") in ("pending", "sent"):
                 bad(f"ledger duplicate: dispatch {x.get('id')} [{x.get('status')}] "
                     f"filed {x.get('filed_at')} already carries this parent_id")
                 break
+    if mine is None:
+        cautions.append("platform duplicate check unavailable: my-comments fetch failed")
+    else:
+        for c in mine:
+            if c.get("parent_id") == parent_id or c.get("parent") == parent_id:
+                bad(f"platform duplicate: my comment {c.get('id')} already "
+                    f"sits under {parent_id} ({c.get('created_at')})")
+                break
+    # the walked listing holds every comment on the post, mine included: a
+    # reply of mine older than the latest 100 agent comments still shows here
+    for c in listing:
+        if (c.get("parent_id") == parent_id or c.get("parent") == parent_id) \
+                and (c.get("author") or {}).get("name") == ME:
+            bad(f"platform duplicate (in listing): my comment {c.get('id')} already "
+                f"sits under {parent_id} ({c.get('created_at')})")
+            break
 
     body = draft.get("body") or ""
     if not body.strip():
@@ -233,6 +272,17 @@ def selftest():
     d, n, c = chk(draft(), listing, [], [], today=TODAY,
                     listing_meta={"unverified": "post fetch refused: cap"})
     ok.append(("unverified count cautions", any("UNVERIFIED" in x for x in c)))
+    d, n, c = chk(draft(), listing, None, [], today=TODAY)
+    ok.append(("ledger down cautions", any("ledger duplicate check unavailable" in x for x in c)))
+    d, n, c = chk(draft(), listing, [], None, today=TODAY)
+    ok.append(("mine down cautions", any("platform duplicate check unavailable" in x for x in c)))
+    d, n, c = chk(draft(body=42), listing, [], [], today=TODAY)
+    ok.append(("non-string body caught", any("not a string" in x for x in d)))
+    d, n, c = chk(draft(parent_id="b" * 8), listing, [], [], today=TODAY)
+    ok.append(("short parent resolves", d == [] and any("parent_id resolved" in x for x in n)))
+    amb = [dict(listing[0], id="b" * 8 + "-9999-2222-3333-444455556666")] + listing
+    d, n, c = chk(draft(parent_id="b" * 8), amb, [], [], today=TODAY)
+    ok.append(("ambiguous parent caught", any("ambiguous" in x for x in d)))
     d, _, _ = chk(draft(do="comment_moltbook"), listing, [], [], today=TODAY)
     ok.append(("wrong do fails", any("do is" in x for x in d)))
     d, _, _ = chk(draft(parent_id="deadbeef"), listing, [], [], today=TODAY)
@@ -242,6 +292,14 @@ def selftest():
     mine = [{"id": "d" * 8 + "-1111-2222-3333-444455556666", "parent_id": draft()["parent_id"],
              "created_at": "2026-11-26T00:00:00Z"}]
     d, _, _ = chk(draft(), listing, [], mine, today=TODAY)
+    mine_old = [{"id": "e" * 8 + "-1111-2222-3333-444455556666", "parent_id": draft()["parent_id"],
+                 "created_at": "2026-11-20T00:00:00Z"}]
+    d, _, _ = chk(draft(), listing, [], mine_old, today=TODAY)
+    ok.append(("old duplicate caught", any("platform duplicate" in x for x in d)))
+    listing_dup = [dict(listing[0], id="f" * 8 + "-1111-2222-3333-444455556666",
+                        parent_id=draft()["parent_id"], author={"name": ME})]
+    d, _, _ = chk(draft(), listing_dup, [], [], today=TODAY)
+    ok.append(("listing duplicate caught", any("in listing" in x for x in d)))
     ok.append(("platform duplicate caught", any("platform duplicate" in x for x in d)))
     ledger = [{"id": 37, "status": "pending", "filed_at": "2026-11-27T09:01:06Z",
                "parent_id": draft()["parent_id"]}]
