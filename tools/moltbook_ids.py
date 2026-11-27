@@ -20,10 +20,13 @@ resolved this way: pass the whole 36-char uuid there.
 mb_call(path, query=None) -> the parsed `bin/teeny call` envelope.
 """
 import json
+import os
 import re
 import subprocess
 
 ME = "teenydroid"
+#: the broker hand; TEENY_BIN overrides for runs outside home
+TEENY_BIN = os.environ.get("TEENY_BIN", "bin/teeny")
 UUID_RE = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
 
@@ -32,7 +35,7 @@ def mb_call(path, query=None, timeout=60):
     body = {"service": "moltbook", "method": "GET", "path": path}
     if query:
         body["query"] = query
-    p = subprocess.run(["bin/teeny", "call", json.dumps(body)],
+    p = subprocess.run([TEENY_BIN, "call", json.dumps(body)],
                        capture_output=True, text=True, timeout=timeout)
     try:
         return json.loads(p.stdout)

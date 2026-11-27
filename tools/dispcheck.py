@@ -14,7 +14,9 @@ Checks, in order:
   2. id shape: post_id a whole 36-char uuid (short ids resolved via
      moltbook_ids.resolve_post_id, loud on no match); parent_id a whole
      uuid or a short comment id resolved against the post's own comment
-     listing (ambiguous or unmatched = defect).
+     listing (ambiguous or unmatched = defect; a capped or gap-short
+     listing refuses the prefix: an incomplete listing cannot prove
+     uniqueness).
   3. membership: parent_id appears verbatim in the post's comment listing
      (fresh GET, or --listing file); the listing's comments sit on post_id.
   4. parent state: exists, not deleted, not spam, author is not teenydroid
@@ -25,9 +27,11 @@ Checks, in order:
      parent_id (the 09:1xZ twin-run case dies here).
   7. body: non-empty, no control characters.
   8. expiry: ISO date, in the future, at most 7 days out.
-  9. count gap: the post's comment_count vs rows the listing serves. A
-     gap is the silent-truncation specimen (post says 30, listing serves
-     28): the verdict downgrades to CAUTION and the gap is named.
+  9. count gap: the post's declared comment_count vs rows the listing
+     serves. A gap is the silent-truncation specimen (post says 30,
+     listing serves 28): the verdict downgrades to CAUTION and the gap is
+     named. When this tool walks the listing itself, the declared count
+     is kept until the walk lands, then served is filled from it.
 
 Usage:
   python3 tools/dispcheck.py --draft work/tmp/disp-x.json [--listing f.json]
@@ -39,7 +43,6 @@ Reads only: `bin/teeny call` GETs and `bin/teeny dispatches`. Never writes.
 """
 import argparse
 import json
-import os
 import re
 import subprocess
 import sys
@@ -47,12 +50,30 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from moltbook_ids import ME, UUID_RE, mb_call, resolve_post_id
+from moltbook_ids import ME, TEENY_BIN, UUID_RE, mb_call, resolve_post_id
 
 CTRL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
-#: the broker hand; TEENY_BIN overrides for runs outside home
-TEENY = os.environ.get("TEENY_BIN", "bin/teeny")
+#: the broker hand comes from moltbook_ids (TEENY_BIN overrides it
+#: there), so every subprocess this tool fires shares one setting
+TEENY = TEENY_BIN
 MAX_AGE_DAYS = 7
+LISTING_PAGES = 5  # cap: moltbook reads are a shared daily budget
+
+
+def _walk_listing(post_id):
+    """Every comment on post_id, page-walked. Returns (listing, err, complete)."""
+    listing, page = [], 1
+    while page <= LISTING_PAGES:
+        d = mb_call(f"/posts/{post_id}/comments", {"limit": 100, "page": page})
+        if d.get("status") != "ok":
+            return None, f"comment listing fetch failed: {json.dumps(d)[:200]}", False
+        batch = d.get("result", {}).get("json", {}).get("comments", [])
+        listing.extend(batch)
+        if len(batch) < 100:
+            return listing, None, True
+        page += 1
+    return listing, None, False
+
 
 
 def dispatches():
@@ -75,12 +96,13 @@ def my_comments():
 
 
 def check(draft, listing, ledger, mine, today=None, listing_meta=None,
-          resolve=None):
+          resolve=None, fetch=None):
     defects, notes = [], []
     cautions = []
     if today is None:
         today = datetime.now(timezone.utc).date()
     resolve = resolve or resolve_post_id
+    fetch = fetch or _walk_listing
 
     def bad(msg):
         defects.append(msg)
@@ -120,35 +142,45 @@ def check(draft, listing, ledger, mine, today=None, listing_meta=None,
     if defects:
         return defects, notes, cautions
 
+    walk_complete = True
     if listing is None:
-        listing, page = [], 1
-        while page <= 5:  # cap: reads are capped too
-            d = mb_call(f"/posts/{post_id}/comments", {"limit": 100, "page": page})
-            if d.get("status") != "ok":
-                bad(f"comment listing fetch failed: {json.dumps(d)[:200]}")
-                return defects, notes, cautions
-            batch = d.get("result", {}).get("json", {}).get("comments", [])
-            listing.extend(batch)
-            if len(batch) < 100:
-                break
-            page += 1
-        if page > 5:
-            cautions.append(f"listing walked 5 pages ({len(listing)} comments) and "
-                            f"stopped on cap; later pages unread")
+        listing, err, walk_complete = fetch(post_id)
+        if err:
+            bad(err)
+            return defects, notes, cautions
+        if not walk_complete:
+            cautions.append(f"listing walked {LISTING_PAGES} pages "
+                            f"({len(listing)} comments) and stopped on cap; "
+                            f"later pages unread")
+    # the declared count survives until a served count exists: when this run
+    # walked the listing itself, the walk's length is the served count
+    if isinstance(listing_meta, dict) and listing_meta.get("served") is None \
+            and isinstance(listing_meta.get("comment_count"), int) and listing:
+        listing_meta["served"] = len(listing)
     if not listing:
         bad("comment listing is empty: parent cannot be a member of it")
         return defects, notes, cautions
     if short_parent is not None:
-        hits = [c.get("id") for c in listing
-                if isinstance(c.get("id"), str) and c.get("id").startswith(short_parent)]
-        if len(hits) == 1:
-            parent_id = hits[0]
-            notes.append(f"parent_id resolved to whole uuid {parent_id}")
-            draft["parent_id"] = parent_id
-        elif len(hits) > 1:
-            bad(f"parent_id {short_parent!r} matches {len(hits)} comments; ambiguous")
+        meta = listing_meta if isinstance(listing_meta, dict) else {}
+        declared, served = meta.get("comment_count"), meta.get("served")
+        gap = isinstance(declared, int) and isinstance(served, int) and declared > served
+        if not walk_complete or gap:
+            why = "walk stopped on the page cap" if not walk_complete \
+                else f"post declares {declared} comments, listing served {served}"
+            bad(f"parent_id {short_parent!r} not resolved: the listing is "
+                f"incomplete ({why}); a prefix match here could bind to the "
+                f"wrong comment - pass the whole 36-char uuid")
         else:
-            bad(f"parent_id {short_parent!r} matches no comment in the listing")
+            hits = [c.get("id") for c in listing
+                    if isinstance(c.get("id"), str) and c.get("id").startswith(short_parent)]
+            if len(hits) == 1:
+                parent_id = hits[0]
+                notes.append(f"parent_id resolved to whole uuid {parent_id}")
+                draft["parent_id"] = parent_id
+            elif len(hits) > 1:
+                bad(f"parent_id {short_parent!r} matches {len(hits)} comments; ambiguous")
+            else:
+                bad(f"parent_id {short_parent!r} matches no comment in the listing")
 
     ids = [c.get("id") for c in listing]
     off_post = [c.get("id") for c in listing if c.get("post_id") not in (None, post_id)]
@@ -325,6 +357,25 @@ def selftest():
     gone = [dict(listing[0], is_deleted=True)]
     d, _, _ = chk(draft(), gone, [], [], today=TODAY)
     ok.append(("deleted parent caught", any("deleted" in x for x in d)))
+    # round-2 fixes
+    seen = []
+    d, _, _ = chk(draft(), None, [], [], today=TODAY,
+                  fetch=lambda pid: (seen.append(pid) or (listing, None, True)))
+    ok.append(("live walk routes through fetch", seen == [draft()["post_id"]] and d == []))
+    d, _, c = chk(draft(), listing, [], [], today=TODAY,
+                  listing_meta={"comment_count": 30, "served": None},
+                  fetch=lambda pid: ([listing[0]], None, True))
+    ok.append(("served backfilled from walk", any("count gap" in x for x in c)))
+    d, _, c2 = chk(draft(parent_id="b" * 8), None, [], [], today=TODAY,
+                   fetch=lambda pid: (listing, None, False))
+    ok.append(("short parent refused on capped walk",
+               any("page cap" in x for x in d) and any("stopped on cap" in x for x in c2)))
+    d, _, _ = chk(draft(parent_id="b" * 8), listing, [], [], today=TODAY,
+                  listing_meta={"comment_count": 30, "served": 28})
+    ok.append(("short parent refused on gap listing", any("served 28" in x for x in d)))
+    d, _, _ = chk(draft(parent_id="b" * 8), listing, [], [], today=TODAY,
+                  fetch=lambda pid: (listing, None, True))
+    ok.append(("short parent still resolves on complete listing", d == []))
     failed = [name for name, passed in ok if not passed]
     for name, passed in ok:
         print(f"  {'ok ' if passed else 'FAIL'} {name}")
@@ -351,6 +402,9 @@ def main():
     except Exception as e:
         print(f"bad input: cannot read draft: {e}", file=sys.stderr)
         sys.exit(2)
+    if not isinstance(draft, dict):
+        print("bad input: draft is not a json object", file=sys.stderr)
+        sys.exit(2)
     listing = None
     listing_meta = None
     if a.listing:
@@ -366,25 +420,39 @@ def main():
                 listing_meta = {"comment_count": j.get("comment_count", j.get("count")),
                                 "served": len(listing)}
     # declared count comes from the post object itself (the silent-truncation
-    # specimen lives exactly there: post says N, listing serves M < N)
+    # specimen lives exactly there: post says N, listing serves M < N).
+    # A short post_id is resolved FIRST ([12]): the post endpoint takes
+    # whole uuids only since 06:00Z, and the count belongs to the resolved
+    # thread, not to the prefix.
     post_meta = None
     post_fetch_note = None
     pid = draft.get("post_id") or ""
-    if re.fullmatch(UUID_RE, pid):
-        pd = mb_call(f"/posts/{pid}", {})
-        if isinstance(pd, dict) and pd.get("status") == "ok":
-            post_meta = (pd.get("result", {}).get("json", {}) or {})
-        else:
-            post_fetch_note = json.dumps(pd.get("result", pd))[:160]
+    try:
+        pid = resolve_post_id(pid)
+    except (ValueError, RuntimeError) as e:
+        print(f"bad input: post_id unresolvable: {e}", file=sys.stderr)
+        sys.exit(2)
+    draft["post_id"] = pid  # check() sees the whole uuid, resolver no-ops
+    pd = mb_call(f"/posts/{pid}", {})
+    if isinstance(pd, dict) and pd.get("status") == "ok":
+        post_meta = (pd.get("result", {}).get("json", {}) or {})
+    else:
+        post_fetch_note = json.dumps(pd.get("result", pd))[:160]
     ledger = dispatches()
     if ledger is None:
         print("warn: dispatches ledger unreadable; ledger-duplicate check skipped")
     mine = my_comments()
     if mine is None:
         print("warn: my-comments fetch failed; platform-duplicate check skipped")
-    if post_meta and isinstance(post_meta.get("comment_count"), int):
-        served = len(listing) if listing is not None else None
-        listing_meta = {"comment_count": post_meta["comment_count"], "served": served} if served is not None else {}
+    declared = post_meta.get("comment_count") if isinstance(post_meta, dict) else None
+    if isinstance(declared, int):
+        if isinstance(listing_meta, dict) and listing_meta.get("comment_count") is None:
+            listing_meta["comment_count"] = declared
+        elif listing_meta is None:
+            # served stays None when this run cannot count the listing yet;
+            # check() backfills it from the walk it actually made ([13])
+            served = len(listing) if listing is not None else None
+            listing_meta = {"comment_count": declared, "served": served}
     elif post_fetch_note:
         listing_meta = {"unverified": f"post fetch refused, count-gap check could not run: {post_fetch_note}"}
     defects, notes, cautions = check(draft, listing, ledger, mine, listing_meta=listing_meta)
