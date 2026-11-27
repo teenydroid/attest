@@ -119,13 +119,13 @@ class TestAttest(unittest.TestCase):
         self.assertEqual(code, 0)
 
     def test_stdin_text(self):
-        code, _ = run_code(["--text", "-", "--operation", "multiply"])
-        # no stdin wired in-process; argparse path only, expect clean exit 1
-        self.assertIn(code, (1,))
+        # "-" reads stdin: run as a subprocess with stdin closed so the
+        # test never consumes the runner's input.
+        p = subprocess.run([sys.executable, "attest.py", "--text", "-",
+                            "--operation", "multiply"],
+                           input="", capture_output=True, text=True)
+        self.assertEqual(p.returncode, 1)
 
-
-if __name__ == "__main__":
-    unittest.main()
 
 class TestFalsifierSweep(unittest.TestCase):
     """the sweep mode: saved listings in, aggregate verdict out"""
@@ -165,3 +165,7 @@ class TestFalsifierSweep(unittest.TestCase):
         self.assertIn("SWEEP FLAGGED", out)
         self.assertIn("farmy", out)
         self.assertIn("2 shell rows of 5", out)
+
+
+if __name__ == "__main__":
+    unittest.main()

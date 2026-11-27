@@ -1,5 +1,5 @@
---- work/tmp/pr-attest-orig/paywall.py	2026-11-26 07:05:40.718551195 +0000
-+++ work/tmp/pr-attest-bundle/paywall.py	2026-11-26 07:09:16.597151943 +0000
+--- a/hands/lib/teeny_hands/wallet/paywall.py	2026-11-27 18:00:00.000000 +0000
++++ b/hands/lib/teeny_hands/wallet/paywall.py	2026-11-27 18:00:00.000000 +0000
 @@ -4,6 +4,14 @@
      GET /stats    Teeny's latest public stats snapshot (the numbers
                    bin/receipts publishes), as JSON
@@ -108,7 +108,7 @@
  def _facilitator(path: str, body: Json) -> Json:
      base = (hand.setting("X402_FACILITATOR_URL") or "").rstrip("/")
      if not base.startswith("https://") and not base.startswith("http://127.0.0.1"):
-@@ -200,17 +249,28 @@
+@@ -200,16 +249,32 @@
          conn.close()
  
  
@@ -128,18 +128,22 @@
          return 405, {}, {"error": "GET only"}
      req = requirements(path)
      header = next((v for k, v in headers.items() if k.lower() == "x-payment"), None)
++    if path == "/attest":
++        # The body's shape is checked before any payment moves, paid or
++        # not: nobody pays for a call that could never grade. The
++        # verdict itself is never free. A paid malformed body is
++        # rejected 400 here, before verify/settle; the post-settlement
++        # 422 stays for unexpected grading failures.
++        try:
++            grade_request(request_body)
++        except hand.Refused as refused:
++            if header:
++                return 400, {}, {"error": refused.reason}
++            return 402, {}, {"x402Version": X402_VERSION, "error": refused.reason, "accepts": [req]}
      if not header:
-+        if path == "/attest":
-+            # The body's shape is checked for free: nobody pays for a call
-+            # that could never grade. The verdict itself is never free.
-+            try:
-+                grade_request(request_body)
-+            except hand.Refused as refused:
-+                return 402, {}, {"x402Version": X402_VERSION, "error": refused.reason, "accepts": [req]}
          return 402, {}, {"x402Version": X402_VERSION, "error": "X-PAYMENT header is required", "accepts": [req]}
  
-     def refuse(why: str) -> tuple[int, dict[str, str], Json]:
-@@ -239,10 +299,19 @@
+@@ -239,10 +304,19 @@
          return refuse("that payment was already used")
      if not _paid_on_chain(signature, req):
          return refuse("the settled transaction does not pay this price to this address")
@@ -161,12 +165,39 @@
  
  
  def serve(host: str, port: int) -> None:
-@@ -254,7 +323,13 @@
+@@ -252,9 +326,40 @@
+         def log_message(self, *args: Any) -> None:
+             pass
  
++        MAX_BODY_BYTES = 65536
++
          def _answer(self) -> None:
              try:
 -                status, extra, body = handle(self.command, self.path.split("?", 1)[0], dict(self.headers))
-+                length = int(self.headers.get("content-length") or 0)
++                try:
++                    length = int(self.headers.get("content-length") or 0)
++                except ValueError:
++                    length = -1
++                if length < 0:
++                    self.close_connection = True
++                    status, extra, body = 400, {}, {"error": "bad content-length"}
++                    data = json.dumps(body).encode()
++                    self.send_response(status)
++                    self.send_header("content-type", "application/json")
++                    self.send_header("content-length", str(len(data)))
++                    self.end_headers()
++                    self.wfile.write(data)
++                    return
++                if length > MAX_BODY_BYTES:
++                    self.close_connection = True
++                    status, extra, body = 413, {}, {"error": "request body too large"}
++                    data = json.dumps(body).encode()
++                    self.send_response(status)
++                    self.send_header("content-type", "application/json")
++                    self.send_header("content-length", str(len(data)))
++                    self.end_headers()
++                    self.wfile.write(data)
++                    return
 +                raw = self.rfile.read(length) if length else b""
 +                try:
 +                    parsed = json.loads(raw) if raw else None
@@ -176,8 +207,9 @@
              except Exception:  # noqa: BLE001 - a buyer gets a status, never a trace
                  status, extra, body = 500, {}, {"error": "internal"}
              data = json.dumps(body).encode()
---- work/tmp/pr-attest-orig/prices.toml	2026-11-26 07:05:40.719363588 +0000
-+++ work/tmp/pr-attest-bundle/prices.toml	2026-11-26 07:09:16.598374769 +0000
+
+--- a/evals/prices.toml	2026-11-27 18:00:00.000000 +0000
++++ b/evals/prices.toml	2026-11-27 18:00:00.000000 +0000
 @@ -12,6 +12,9 @@
  # One read of Teeny's latest public stats snapshot from its paid endpoint
  # (x402, https://x402.<DEPLOY_DOMAIN>/stats; wallet/paywall.py).
@@ -188,8 +220,9 @@
  
  [refunds]
  # The most one refund may be: a deposit above it is refunded by a person.
---- work/tmp/pr-attest-orig/sites.teeny.enamakel.com.conf	2026-11-26 07:05:40.720113908 +0000
-+++ work/tmp/pr-attest-bundle/sites.teeny.enamakel.com.conf	2026-11-26 07:09:16.598399065 +0000
+
+--- a/deploy/nginx/sites.teeny.enamakel.com.conf	2026-11-27 18:00:00.000000 +0000
++++ b/deploy/nginx/sites.teeny.enamakel.com.conf	2026-11-27 18:00:00.000000 +0000
 @@ -86,6 +86,17 @@
          proxy_set_header X-PAYMENT $http_x_payment;
      }
@@ -208,8 +241,9 @@
      location / {
          return 404;
      }
---- work/tmp/pr-attest-orig/bin-paywall	2026-11-26 07:05:40.721441510 +0000
-+++ work/tmp/pr-attest-bundle/paywall	2026-11-26 07:09:16.598415540 +0000
+
+--- a/bin/paywall	2026-11-27 18:00:00.000000 +0000
++++ b/bin/paywall	2026-11-27 18:00:00.000000 +0000
 @@ -1,6 +1,8 @@
  #!/usr/bin/env -S python3 -I
  """Teeny's paid endpoint (hands/lib/teeny_hands/wallet/paywall.py;
@@ -221,9 +255,481 @@
      bin/paywall [--host 0.0.0.0] [--port 3130]
  
 
-======================================================================
-# docs rows (roadmap S4, hands.md paid endpoint, architecture.md)
-======================================================================
+--- /dev/null	2026-11-27 18:00:00.000000 +0000
++++ b/hands/lib/teeny_hands/wallet/attest.py	2026-11-27 18:00:00.000000 +0000
+@@ -0,0 +1,135 @@
++"""attest: check a challenge answer against the challenge text.
++
++Scans the raw challenge text for evidence that attests the operation the
++solver applied (an operator glyph or a phrase from a bundled synonym list)
++and reports every operation the text attests.
++
++Verdicts:
++  attested              the applied operation is attested and the text
++                        attests nothing else: the answer may ship
++  attested-but-ambiguous  the applied operation is attested but the text
++                        attests two or more competing operations (an
++                        ambiguous challenge): the answer must not ship
++  not-attested          the applied operation is NOT attested: the answer
++                        likely came from a fallback default; the solver
++                        should say 'unknown' instead of shipping a
++                        confident wrong answer
++
++No network, no accounts, no keys. Stdlib only.
++"""
++
++import re
++
++# Bare "of" attests multiply ("half of 12", "15% of 80") but not after
++# these words, where it belongs to another construction ("sum of",
++# "out of 100").
++OF_EXCLUDE = re.compile(
++    r"\b(?:sum|total|product|difference|average|combined|out|kind|type|"
++    r"lot|sort|one|some|all|most|many|number|group|set|list|part|instead|"
++    r"because|course)\s+$", re.IGNORECASE)
++OF = "of"
++
++# operation -> glyph patterns (label -> regex) and cue phrases.
++# Glyph patterns demand operator context so prose hyphens, markdown
++# bold and URLs do not count as operators.
++OPERATIONS = {
++    "multiply": {
++        "glyphs": {"*": r"\d[ \t]*\*[ \t]*\d|[^\s][ \t]\*[ \t]", "×": r"×", "x": r"\bx\b"},
++        "phrases": ["times", "multiplied by", "multiply", "product",
++                    "doubled", "tripled", "quadrupled", OF],
++    },
++    "add": {
++        "glyphs": {"+": r"\+", "＋": r"＋"},
++        "phrases": ["plus", "sum", "total", "add", "added to",
++                    "combined", "altogether"],
++    },
++    "subtract": {
++        "glyphs": {"-": r"\d\s*-\s*\d", "−": r"−", "–": r"\d\s*–\s*\d"},
++        "phrases": ["minus", "difference", "subtract", "less",
++                    "fewer", "remaining"],
++    },
++    "divide": {
++        "glyphs": {"/": r"\d\s*/\s*\d", "÷": r"÷"},
++        "phrases": ["divided by", "divided", "divide", "per", "split",
++                    "shared equally", "quotient", "ratio"],
++    },
++}
++
++
++def _context(text, start, end, width=24):
++    lo, hi = max(0, start - width), min(len(text), end + width)
++    snippet = text[lo:hi].replace("\n", " ").strip()
++    return snippet if lo == 0 else "..." + snippet
++
++
++def find_evidence(text):
++    """Return {operation: [evidence strings]} for every attested operation."""
++    found = {}
++    for op, spec in OPERATIONS.items():
++        hits = []
++        for label, pattern in spec["glyphs"].items():
++            for m in re.finditer(pattern, text, re.IGNORECASE):
++                hits.append("glyph %r near %r" % (label, _context(text, m.start(), m.end())))
++        for phrase in spec["phrases"]:
++            if phrase == "of":
++                for m in re.finditer(r"\bof\b", text, re.IGNORECASE):
++                    if OF_EXCLUDE.search(text[:m.start()]):
++                        continue
++                    hits.append("phrase 'of' near %r" % _context(text, m.start(), m.end()))
++                continue
++            pattern = phrase if phrase.startswith("(?") else r"\b" + re.escape(phrase) + r"\b"
++            for m in re.finditer(pattern, text, re.IGNORECASE):
++                hits.append("phrase %r near %r" % (phrase.replace("\\b", "").strip(),
++                                                   _context(text, m.start(), m.end())))
++        if hits:
++            found[op] = hits
++    return found
++
++
++SYNONYMS = {"times": "multiply", "product": "multiply",
++            "sum": "add", "total": "add", "plus": "add",
++            "minus": "subtract", "difference": "subtract",
++            "divided": "divide", "per": "divide", "quotient": "divide"}
++
++
++def recognise_applied(operation):
++    """Map the solver's applied-operation string to a known operation.
++    Whole tokens only: operand words like "added" must not select add
++    over subtract."""
++    words = re.findall(r"[a-z]+", operation.strip().lower())
++    for word in words:
++        if word in OPERATIONS:
++            return word
++    for word in words:
++        if word in SYNONYMS:
++            return SYNONYMS[word]
++    return None
++
++
++def grade(text, operation, answer=None):
++    """One grading: returns the report dict. `verdict` is 'attested',
++    'attested-but-ambiguous' or 'not-attested'."""
++    applied_op = recognise_applied(operation)
++    if applied_op is None:
++        # Unsupported operation: report the text's own evidence (an
++        # ambiguous challenge is worth knowing even when the operation
++        # itself cannot be graded).
++        found = find_evidence(text)
++        return {"applied_operation": None, "applied_raw": operation, "answer": answer,
++                "attested": False, "ambiguous": len(found) > 1,
++                "attested_operations": found, "verdict": "not-attested"}
++    found = find_evidence(text)
++    attested = applied_op in found
++    ambiguous = len(found) > 1
++    return {
++        "applied_operation": applied_op,
++        "applied_raw": operation,
++        "answer": answer,
++        "attested": attested,
++        "ambiguous": ambiguous,
++        "attested_operations": found,
++        "verdict": (
++            "attested" if attested and not ambiguous else
++            "attested-but-ambiguous" if attested else
++            "not-attested"),
++    }
+
+--- /dev/null	2026-11-27 18:00:00.000000 +0000
++++ b/hands/tests/wallet/test_paywall_attest.py	2026-11-27 18:00:00.000000 +0000
+@@ -0,0 +1,141 @@
++"""The /attest grading resource: an unpaid call gets the frozen price and
++the corpus count; a settled payment grades the body and writes one inflow
++row, a `sale` with ref `x402:attest`; a body that can never grade is
++refused before payment (nobody pays for a doomed call); a paid call whose
++grading fails is recorded (the money settled) and answered with a
++refundable 422, never a silent 200. The verdict is never free. Reuses the /stats harness: the core, the chain and the
++facilitator are faked; Teeny's wallet signs nothing."""
++
++from __future__ import annotations
++
++import base64
++import json
++import unittest
++from pathlib import Path
++
++from wallet.support import OWN, USDC_MAINNET
++from wallet.test_paywall import PRICE, TX, PaywallTest, header
++from teeny_hands import hand
++from teeny_hands.wallet import paywall
++
++ATTEST_PRICE = 10_000  # evals/prices.toml: attest_grade_usdc = "0.01"
++DESCRIPTION = "One challenge answer graded against the challenge text (attest corpus, 23 frames)"
++
++TEXT = "What is 32 times 4?"
++GOOD = {"text": TEXT, "operation": "multiply 32 by 4", "answer": "128"}
++BAD = {"text": "What is 32 plus 4?", "operation": "multiply 32 by 4", "answer": "36"}
++
++
++class AttestTest(PaywallTest):
++    def post(self, body=None, payment=None):
++        return paywall.handle("POST", "/attest", {"X-PAYMENT": payment} if payment else {}, body)
++
++    def test_an_unpaid_call_gets_the_attest_price_and_the_corpus_count(self):
++        status, _, body = self.post(GOOD)
++        self.assertEqual(status, 402)
++        (req,) = body["accepts"]
++        self.assertEqual((req["scheme"], req["network"], req["maxAmountRequired"], req["payTo"], req["asset"]),
++                         ("exact", "solana", str(ATTEST_PRICE), OWN, USDC_MAINNET))
++        self.assertEqual(req["description"], DESCRIPTION)
++        self.assertEqual(self.facilitator.calls, [])
++
++    def test_an_unpaid_call_never_carries_the_verdict(self):
++        status, _, body = self.post(GOOD)
++        self.assertEqual(status, 402)
++        self.assertNotIn("verdict", body)
++        self.assertNotIn("attested_operations", body)
++
++    def test_an_ungradeable_body_is_refused_for_free(self):
++        for body in ({"text": "x"}, {"operation": "add"}, {"text": "", "operation": "add"},
++                     {"text": "x" * 4001, "operation": "add"}, "not an object", None):
++            status, _, resp = self.post(body)
++            self.assertEqual(status, 402, body)
++            self.assertIn("accepts", resp)
++        self.assertEqual(self.facilitator.calls, [])
++
++    def test_a_settled_payment_grades_and_records_the_sale(self):
++        status, extra, body = self.post(GOOD, header())
++        self.assertEqual(status, 200, body)
++        self.assertEqual(body["verdict"], "attested")
++        self.assertEqual(body["applied_operation"], "multiply")
++        self.assertEqual(body["corpus_frames"], 23)
++        self.assertIn("phrase 'times' near", body["attested_operations"]["multiply"][0])
++        receipt = json.loads(base64.b64decode(extra["X-PAYMENT-RESPONSE"]))
++        self.assertEqual(receipt["transaction"], TX)
++        (row,) = self.inflows()
++        self.assertEqual((row["signature"], row["category"], row["ref"], row["amount_raw"]),
++                         (TX, "sale", "x402:attest", ATTEST_PRICE))
++        # Teeny's wallet moved nothing and signed nothing.
++        self.assertEqual(self.moved(), [])
++
++    def test_a_wrong_operation_still_costs_and_still_says_not_attested(self):
++        status, _, body = self.post(BAD, header())
++        self.assertEqual(status, 200, body)
++        self.assertEqual(body["verdict"], "not-attested")
++        (row,) = self.inflows()
++        self.assertEqual((row["category"], row["ref"]), ("sale", "x402:attest"))
++
++    def test_a_paid_call_whose_grading_fails_is_refundable_not_silent(self):
++        original = paywall.grade_request
++
++        def broken(body):
++            raise RuntimeError("grader exploded")
++
++        paywall.grade_request = broken
++        try:
++            status, _, body = self.post(GOOD, header())
++        finally:
++            paywall.grade_request = original
++        self.assertEqual(status, 422, body)
++        self.assertEqual(body["payment"], TX)
++        # The money arrived and is on the books; the 422 is what a person
++        # refunds from.
++        (row,) = self.inflows()
++        self.assertEqual((row["category"], row["ref"]), ("sale", "x402:attest"))
++
++    def test_get_on_attest_is_405(self):
++        self.assertEqual(paywall.handle("GET", "/attest", {})[0], 405)
++
++    def test_unknown_paths_stay_404(self):
++        self.assertEqual(paywall.handle("POST", "/other", {}, GOOD)[0], 404)
++
++    def test_stats_price_is_untouched(self):
++        status, _, body = paywall.handle("GET", "/stats", {})
++        self.assertEqual(status, 402)
++        (req,) = body["accepts"]
++        self.assertEqual(req["maxAmountRequired"], str(PRICE))
++
++
++class AttestCorpusMirror(unittest.TestCase):
++    """The vendored grader must keep reproducing the measured corpus truth
++    (forgeloop's 23 frames, measured 2026-11-24): 14 of the 18 verified
++    frames blocked, f01 blessed on 'total' alone (known bug), f07's
++    rejected add blessed (known bug), f10/f13/f17 refused. If this drifts
++    the grader changed and the corpus receipt is stale: stop and
++    re-measure before selling."""
++
++    def test_the_measured_truth_holds(self):
++        from teeny_hands.wallet import attest
++
++        with open(Path(__file__).resolve().parent / "fixtures" / "forgeloop-corpus.json") as f:
++            frames = json.load(f)
++        blocked, blessed, rejected_shipped = [], [], []
++        for fr in frames:
++            op = fr["op"] if fr["op"] != "-" else "add"
++            report = attest.grade(fr["text"], op, fr.get("answer"))
++            ships = report["verdict"] == "attested"
++            if fr["outcome"] == "verified" and not ships:
++                blocked.append(fr["id"])
++            if fr["outcome"] == "refused" and ships:
++                blessed.append(fr["id"])
++            if fr["outcome"] == "rejected" and ships:
++                rejected_shipped.append(fr["id"])
++        self.assertEqual(sorted(blocked),
++                         ["f02", "f03", "f04", "f05", "f06", "f08", "f09", "f11",
++                          "f12", "f15", "f16", "f19", "f21", "f23"])
++        self.assertEqual(blessed, ["f01"])
++        self.assertEqual(rejected_shipped, ["f07"])
++
++
++if __name__ == "__main__":
++    unittest.main()
+
+--- /dev/null	2026-11-27 18:00:00.000000 +0000
++++ b/hands/tests/wallet/fixtures/forgeloop-corpus.json	2026-11-27 18:00:00.000000 +0000
+@@ -0,0 +1,186 @@
++[
++ {
++  "id": "f01",
++  "date": "11-21",
++  "outcome": "refused",
++  "op": "-",
++  "answer": "-",
++  "text": "\"A lOoO]bSsStEr^ lOoKs Um, lIkE lXo.b StEr- cLaW] fOrCe- Is ThReE^tW/ eNnTy ThReE nOoToNs{ aNd GaAiNss~ FiVe NeU^tOnS frOm MoL.tInG fRiEnD<, wHaT| iS tHe ToTaL- fOrCe?\""
++ },
++ {
++  "id": "f02",
++  "date": "11-21",
++  "outcome": "verified",
++  "op": "add",
++  "answer": "28.00",
++  "text": "\"A] L o- BbStEr S^wImS aT/ TwEnTy T hReE} cEm-MeNtEeR s PeR\\\\ SeCoNd, Um~ AnD InCrEaSeS| By F iV E, WhAt< Is> ThE NeW^ VeLoCcIiTy?\""
++ },
++ {
++  "id": "f03",
++  "date": "11-21",
++  "outcome": "verified",
++  "op": "multiply",
++  "answer": "160.00",
++  "text": "\"A] lOoObSsTtErR sSwImS/ iN tHe~ tIdE, cLaW fOrCe] iS tHiRrTy- tW[o] nEeOotOnNs^ aNd[ sPeEd] iS fIiV/e mEeTeRs\\\\ pEr- sEeCcOnD, mUlTiPlY* tHeSe?\""
++ },
++ {
++  "id": "f04",
++  "date": "11-21",
++  "outcome": "verified",
++  "op": "multiply",
++  "answer": "75.00",
++  "text": "\"ThIs] lOoOobssStEr^ ClAw~ FoRcEe Is] TwEnTy- FiVe {NeW|ToNs} AnD] tHrEe <ClAwS> MuL^tiPlY, HoW/ MuCh- ToTaL ]FoRce Is~ ThErE, umm?\""
++ },
++ {
++  "id": "f05",
++  "date": "11-21",
++  "outcome": "verified",
++  "op": "add",
++  "answer": "33.00",
++  "text": "\"A] LoOoBbBsStTeEr^ S[wImMs Um/ aT tWeEnNy VeElOoOcCiItTy, BuT| hIs^ ClLaAwW ExXeErRtSs TwEnTy NiNe ] NeWtOnS ~ AnD{ hIs TaAiIlL PuUsShHeEs FoOuUrR < NeWtOnS, WhHaT/ Is| ToOtTaAlL FoOrRcEe?\""
++ },
++ {
++  "id": "f06",
++  "date": "11-21",
++  "outcome": "verified",
++  "op": "multiply",
++  "answer": "75.00",
++  "text": "\"A] LoO b-StEr'S ClA w FoR cE Is TwEnTy FiVe NeWToNs Um^ TiMeS ThReE / WhAt Is ToTaL FoR cE? Lo.b st errr lxobqstwer nootons ~ umm\""
++ },
++ {
++  "id": "f07",
++  "date": "11-21",
++  "outcome": "rejected",
++  "op": "add",
++  "answer": "30.00",
++  "text": "\"A] LoObBsStTeEr ] ClAw ExErTs TwEnTy ThReE NoOoToOnS ^ AnD ItS SwImMeReT AdDs SeVeN ~ MoOrRe, WhAt Is ThE ToTaL FoRcE?\""
++ },
++ {
++  "id": "f08",
++  "date": "11-21",
++  "outcome": "verified",
++  "op": "add",
++  "answer": "47.00",
++  "text": "\"A] lO b-StEr~ sW/iMmS| aT^ tHiR.tY fIfE} cE mEnT s PeR- sEcOnD, uM bUt~ aNoThEr\\\\ lOoObSsSsTeR aDdS[ tWe.LvE< cE mEnT s PeR^ sEcOnD, wHaT] iS tHe~ cOmBiNeD- vElOoOcItYyy?\""
++ },
++ {
++  "id": "f09",
++  "date": "11-21",
++  "outcome": "verified",
++  "op": "add",
++  "answer": "30.00",
++  "text": "\"A] lO^bS t-ErR looObSsStTeEr~ wItH/ mOlTtInG aNtEnNaE, sW/iMs- aT {tWeNtY tHrEe} cEmMeTeR s/PeR sEcOnD aNd- aCcElErAtEs| bY <sEvEn>, wHaT/ iS tHe N]eW- vElOo^CiTy?\""
++ },
++ {
++  "id": "f10",
++  "date": "11-22",
++  "outcome": "refused",
++  "op": "-",
++  "answer": "-",
++  "text": "\"A] LoObBsTtErr ] ClAw^ FoRcEe ] iS] TwEnTy ThReE ] TiMeS ^ FoUr ] , ] hOw ] mUcH ] ToTaL ] FoRcEe ] (l oo.b st  errr, nootons, umm, lxobq)?\""
++ },
++ {
++  "id": "f11",
++  "date": "11-22",
++  "outcome": "verified",
++  "op": "multiply",
++  "answer": "90.00",
++  "text": "\"A] lO-bS tEr^ lOoOoBbSsStTeR] sW/iMmS^ aNd- iTs- cLaW^ eXeRtS/ fOrTy FiVe ~ nEeW-tO nS, dUrInG- mO-lT|iNg~ iT-mUlTiPlIeS{ bY< TwO>, hOw/ mUcH- tO tAl/ fOrCe\\\\?\""
++ },
++ {
++  "id": "f12",
++  "date": "11-22",
++  "outcome": "verified",
++  "op": "add",
++  "answer": "32.00",
++  "text": "\"A] LoObBsStTeErR S^wImS[ aT/ tWwEeNnTtYy- fIiVvEe ]cCeEmMmEeTtEeRrS /pPeEr] sEeCcOoNnDd, AnNd~ AcCcEeLlEeRrAaAtEeSs {bY} sSeEvvEeN,, Um| wHaT< iS> ThE/ nEeWw VeElLaAwCcIiTtEeY?\""
++ },
++ {
++  "id": "f13",
++  "date": "11-22",
++  "outcome": "refused",
++  "op": "-",
++  "answer": "-",
++  "text": "\"A] LoObBsStTeErr S^wIiMmS- aT/ tWwEeNnTtYy fIiVVe ]- sEeVVeEn mEeTtEeR S/ pEeR sEeCcOoNnD, wHaT]s ThE nEw sPpEeD? umm lxobqst errr\""
++ },
++ {
++  "id": "f14",
++  "date": "11-22",
++  "outcome": "verified",
++  "op": "add",
++  "answer": "75.00",
++  "text": "\"A] LoOoBbSsStEr S^cLaW sShExErTs] FoRtY TwO NeW^tOnS, AnD/ ThIrTy ThReE NeW^tOnS~ WhAt Is ToTaL F^oRcE?\""
++ },
++ {
++  "id": "f15",
++  "date": "11-22",
++  "outcome": "verified",
++  "op": "multiply",
++  "answer": "60.00",
++  "text": "\"A] LoOoBbSsTtEeRr ]s ClAw^ ExErTs ThIrTy * TwO NeUwToNs, HoW MuCh ToTaL FoRcE? ~ umm lxobqstwer\""
++ },
++ {
++  "id": "f16",
++  "date": "11-22",
++  "outcome": "verified",
++  "op": "add",
++  "answer": "47.00",
++  "text": "\"A] lO^bSt-Er ClAw] FoR^cE iS tHiR-tY fIvE nEu-TooNs um, It] InCrEaSeS bY/ TwE-lVe NeOoToNs ~ WhAt] Is T]oTaL FoR^cE?\""
++ },
++ {
++  "id": "f17",
++  "date": "11-22",
++  "outcome": "refused",
++  "op": "-",
++  "answer": "-",
++  "text": "\"ThE] lOoB-StEr ]ClAw^ FoRcE] oF^ tHiR-ty FivE] NeWtOnS, uM/ plUs] tHe^ OtHeR] ClAw'S ]FoRcE^ oF[ tWeN-Ty TwO] FoUr~, hOw/ mUcH] ToTaL^ FoRce] iS< tHiS>?\""
++ },
++ {
++  "id": "f18",
++  "date": "11-22",
++  "outcome": "verified",
++  "op": "add",
++  "answer": "37.00",
++  "text": "\"] LoOoBbSsTtErR - sTtErR ] sW^iMmS [ LiKe Um ] aNnD ] cLlAaWw F^oR cE ] iS TwEnTy ThReE NoOoToOnS ~ aNd ] oTtHeR ] cLlAaWw iS FoUrTeEn NoOoToOnS ] , WhAt ] iS ToTaL - fOrCe ]?\""
++ },
++ {
++  "id": "f19",
++  "date": "11-22",
++  "outcome": "verified",
++  "op": "add",
++  "answer": "55.00",
++  "text": "\"ThE] LoBbBsTtEr~ SwImS/ aT^ tWeN tY fIvE] CeMmEeNtSs PeR/ SeCcOoNnD, AnD| iTs^ ClLaAw- FoOrRcEe] IiS^ ThIrRtY} NeEwToOnSs~ WhHaT| Is^ ThEiR- SuMm?\""
++ },
++ {
++  "id": "f20",
++  "date": "11-22",
++  "outcome": "verified",
++  "op": "add",
++  "answer": "28.00",
++  "text": "\"A] Loo.O bSsT-eR'S ClAw] FoRcE Is^ TwEnTy ThReE NoOtOnS ~ + FiVe , Um / MoLtInG LoSs AnD SoCiAl DuElS ArE ShOwN < WhAt Is ToTaL FoRcE >\""
++ },
++ {
++  "id": "f21",
++  "date": "11-23",
++  "outcome": "verified",
++  "op": "multiply",
++  "answer": "50.00",
++  "text": "\"A] LoO b-S tErRr ~ClAwW ExE rT s^ TwEeN tY] FiV e NoO tOnS {AnD} HaSs TwO| ClAwS, HoW/ ToTaL~ FoR cE If MuLtIiPlIiEd?\""
++ },
++ {
++  "id": "f22",
++  "date": "11-23",
++  "outcome": "verified",
++  "op": "add",
++  "answer": "50.00",
++  "text": "\"Lo]b-StErS ClAw^ FoRcE Is ThIrTy ]TwO NooOtOnS, AnD AnOtHeR ClAw {Is EiGhTeeN NooOtOnS~ WhAt Is ToTaL FoR-cE?\""
++ },
++ {
++  "id": "f23",
++  "date": "11-23",
++  "outcome": "verified",
++  "op": "add",
++  "answer": "30.00",
++  "text": "\"A] lO^bStEr S[wImS/ aT tWeN-tY ThReE] cEnT-iMeTeRs\\\\ pEr/ sEcOnD, uM lOoobssssterrr AcCeLeRaTeS^ bY sEvEn] cEnT-iMeTeRs< pEr| sEcOnD, wHaT Is/ tHe NeW- vElAwCiTeE?\""
++ }
++]
+
+
 --- a/docs/roadmap.md	2026-11-26 07:09:46.254991687 +0000
 +++ b/docs/roadmap.md	2026-11-26 07:09:58.220618029 +0000
 @@ -198,7 +198,7 @@
