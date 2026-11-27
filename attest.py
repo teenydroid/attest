@@ -22,23 +22,23 @@ import json
 import re
 import sys
 
-# Bare "of" attests multiply ("half of 12", "15% of 80") but not after
-# these words, where it belongs to another construction ("sum of",
-# "out of 100").
-OF = ("(?<!sum )(?<!total )(?<!product )(?<!difference )(?<!average )"
-      "(?<!combined )(?<!out )(?<!kind )(?<!type )(?<!lot )(?<!sort )"
-      "(?<!one )(?<!some )(?<!all )(?<!most )(?<!many )(?<!number )"
-      "(?<!group )(?<!set )(?<!list )(?<!part )(?<!instead )"
-      "(?<!because )(?<!course )\\bof\\b")
+# Bare "of" attests multiply ("half of 12", "15% of 80") but not right
+# after these words, where it belongs to another construction ("sum of",
+# "out of 100"). The exclusion spans any whitespace, so "sum\nof" and
+# "sum  of" are caught too; a fixed-width lookbehind cannot do that.
+OF_EXCLUDE = re.compile(
+    r"\b(sum|total|product|difference|average|combined|out|kind|type|lot|"
+    r"sort|one|some|all|most|many|number|group|set|list|part|instead|"
+    r"because|course)\s+$", re.IGNORECASE)
 
 # operation -> glyph patterns (label -> regex) and cue phrases.
 # Glyph patterns demand operator context so prose hyphens, markdown
 # bold and URLs do not count as operators.
 OPERATIONS = {
     "multiply": {
-        "glyphs": {"*": r"\d\s*\*\s*\d|\s\*\s", "×": r"×", "x": r"\bx\b"},
+        "glyphs": {"*": r"\d[ \t]*\*[ \t]*\d|[^\s][ \t]\*[ \t]", "×": r"×", "x": r"\bx\b"},
         "phrases": ["times", "multiplied by", "multiply", "product",
-                    "doubled", "tripled", "quadrupled", OF],
+                    "doubled", "tripled", "quadrupled", "of"],
     },
     "add": {
         "glyphs": {"+": r"\+", "＋": r"＋"},
@@ -52,7 +52,7 @@ OPERATIONS = {
     },
     "divide": {
         "glyphs": {"/": r"\d\s*/\s*\d", "÷": r"÷"},
-        "phrases": ["divided by", "divided", "per", "split",
+        "phrases": ["divided by", "divided", "divide", "per", "split",
                     "shared equally", "quotient", "ratio"],
     },
 }
@@ -75,6 +75,12 @@ def find_evidence(text):
             for m in re.finditer(pattern, text, re.IGNORECASE):
                 hits.append("glyph %r near %r" % (label, _context(text, m.start(), m.end())))
         for phrase in spec["phrases"]:
+            if phrase == "of":
+                for m in re.finditer(r"\bof\b", text, re.IGNORECASE):
+                    if OF_EXCLUDE.search(text[:m.start()]):
+                        continue
+                    hits.append("phrase 'of' near %r" % _context(text, m.start(), m.end()))
+                continue
             pattern = phrase if phrase.startswith("(?") else r"\b" + re.escape(phrase) + r"\b"
             for m in re.finditer(pattern, text, re.IGNORECASE):
                 hits.append("phrase %r near %r" % (phrase.replace("\\b", "").strip(),
@@ -84,19 +90,23 @@ def find_evidence(text):
     return found
 
 
+SYNONYMS = {"times": "multiply", "product": "multiply",
+            "sum": "add", "total": "add", "plus": "add",
+            "minus": "subtract", "difference": "subtract",
+            "divided": "divide", "per": "divide", "quotient": "divide"}
+
+
 def recognise_applied(operation):
-    """Map the solver's applied-operation string to a known operation."""
-    applied = operation.strip().lower()
-    for op in OPERATIONS:
-        if op in applied or applied.startswith(op[:4]):
-            return op
-    synonyms = {"times": "multiply", "product": "multiply",
-                "sum": "add", "total": "add", "plus": "add",
-                "minus": "subtract", "difference": "subtract",
-                "divided": "divide", "per": "divide", "quotient": "divide"}
-    for word, op in synonyms.items():
-        if word in applied:
-            return op
+    """Map the solver's applied-operation string to a known operation.
+    Whole tokens only: operand words like "added" must not select add
+    over subtract."""
+    words = re.findall(r"[a-z]+", operation.strip().lower())
+    for word in words:
+        if word in OPERATIONS:
+            return word
+    for word in words:
+        if word in SYNONYMS:
+            return SYNONYMS[word]
     return None
 
 

@@ -65,9 +65,11 @@ buyer can check what the price bought.
 
 ## Deployment, after the operator applies the patch
 
-1. nginx reload for the new `/attest` location (POST only).
-2. `X402_ENDPOINT=1` unchanged; the compose service is unchanged.
-3. First real paid call = the goal re-attempt's success condition
+1. paywall process restart (the Python handlers live in the running
+   process; an nginx reload alone loads none of this change).
+2. nginx reload for the new `/attest` location (POST only).
+3. `X402_ENDPOINT=1` unchanged; the compose service is unchanged.
+4. First real paid call = the goal re-attempt's success condition
    (wallet_inflows at least 1 USDC on a fresh window counts every sale).
 
 ## The buyer-side blocker, named
